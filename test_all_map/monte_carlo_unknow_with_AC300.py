@@ -24,18 +24,18 @@ ORANGE = (255, 165, 0)
 
 # START / GOAL (Dịch vào để tránh dính tường)
 START_POS = np.array([2.0, 2.0]) 
-GOAL_POS = np.array([48.0, 48.0]) # Goal tạm thời, sẽ cập nhật theo map nếu cần
+GOAL_POS = np.array([90.0, 90.0]) # Goal tạm thời, sẽ cập nhật theo map nếu cần
 
 # Tham số MCPP
 EPSILON = 5.0           
 EXPLORATION_C = 1.414  
 GAMMA = 1.0            
-MAX_ITERATIONS = 500    
-SEARCH_DEPTH = 20      
+MAX_ITERATIONS = 2000    
+SEARCH_DEPTH = 10      
 
 # --- HÀM LOAD FILE THÔNG MINH (Sửa lỗi map bị nhọn) ---
 def get_all_map_folders(root_dir):
-    pattern = os.path.join(root_dir, "AC12_*") # Tìm tất cả map AC1...
+    pattern = os.path.join(root_dir, "AC10_*") # Tìm tất cả map AC1...
     folders = sorted(glob.glob(pattern))
     return folders
 
@@ -54,13 +54,6 @@ def load_outer_polygon(filepath):
     return poly
 
 def load_holes_multi(filepath):
-    """
-    SỬA LỖI QUAN TRỌNG: Đọc nhiều hố trong cùng 1 file.
-    Giả định: Các hố ngăn cách nhau bởi dòng trống hoặc định dạng NaN.
-    Nếu file viết liền tù tì, ta cần logic khác. 
-    Ở đây dùng logic: Nếu khoảng cách giữa 2 điểm liên tiếp quá xa (> 50% map), có thể là hố mới (Heuristic)
-    HOẶC: Parse theo dòng trống (Cách chuẩn).
-    """
     holes_list = []
     current_hole = []
     

@@ -29,7 +29,7 @@ RRT_GOAL_SAMPLE_RATE = 0.1
 MCPP_EPSILON = 5.0
 MCPP_C = 1.414
 MCPP_ITER = 1000
-MCPP_DEPTH = 25
+MCPP_DEPTH = 30
 
 # Màu sắc
 WHITE = (255, 255, 255)
@@ -311,18 +311,29 @@ def calculate_path_len(path):
 # ==========================================
 # MAIN APP HOÀN CHỈNH
 # ==========================================
-# ==========================================
-# MAIN APP (SINGLE GOAL)
-# ==========================================
 def main():
     global SCALE 
     pygame.init()
+    
+    # Tắt cảnh báo Pygame (Optional)
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module="pygame")
+
     if not os.path.exists(RESULT_DIR): os.makedirs(RESULT_DIR)
     
-    timestamp = datetime.datetime.now().strftime("%H%M%S")
-    csv_file = os.path.join(RESULT_DIR, f"SingleGoal_{timestamp}.csv")
-    with open(csv_file, 'w', newline='') as f:
-        csv.writer(f).writerow(["Map", "Algo", "Original Len", "Optimized Len", "Improvement (%)", "Collisions"])
+    # --- THAY ĐỔI: SỬ DỤNG 1 FILE DUY NHẤT ---
+    # Đặt tên cố định, không dùng timestamp nữa
+    csv_file = os.path.join(RESULT_DIR, "All_Results_Summary.csv")
+    
+    # Kiểm tra xem file đã có chưa. Nếu chưa có thì mới tạo và ghi Header.
+    file_exists = os.path.isfile(csv_file)
+    
+    if not file_exists:
+        with open(csv_file, 'w', newline='', encoding='utf-8') as f:
+            csv.writer(f).writerow(["Map", "Algo", "Time (s)", "Original Len", "Optimized Len", "Improvement (%)", "Collisions"])
+        print(f"--> [INFO] Đã tạo file mới: {csv_file}")
+    else:
+        print(f"--> [INFO] Sẽ ghi nối tiếp vào file: {csv_file}")
 
     screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
     pygame.display.set_caption("Single Goal: RRT vs MCPP with Optimization")
@@ -330,7 +341,7 @@ def main():
     font = pygame.font.SysFont("Consolas", 16)
     font_big = pygame.font.SysFont("Consolas", 24)
 
-    map_folders = sorted(glob.glob(os.path.join(DATASET_DIR, "AC10_*")))
+    map_folders = sorted(glob.glob(os.path.join(DATASET_DIR, "AC11_*")))
     if not map_folders: 
         print(f"Lỗi: Không tìm thấy map trong {DATASET_DIR}")
         return
@@ -345,16 +356,17 @@ def main():
     
     known_holes = []
     path_history = [] 
-    optimized_path = [] # Đường đi tối ưu (chỉ có khi finish)
+    optimized_path = [] 
     
     rrt_path = []; rrt_vis = None; mcpp_vis = None
     
     start_time = 0; elapsed_time = 0; collisions_count = 0
+    final_time = 0 
     finished = False; data_saved = False; finish_cooldown = 0
 
     def reset_sim(new_map=False):
         nonlocal outer_poly, real_holes, current_pos, goal_pos, known_holes, path_history
-        nonlocal rrt_path, rrt_vis, mcpp_vis, finished, data_saved, start_time, collisions_count, optimized_path
+        nonlocal rrt_path, rrt_vis, mcpp_vis, finished, data_saved, start_time, collisions_count, optimized_path, final_time
         global SCALE
 
         folder = map_folders[current_map_idx]
@@ -369,7 +381,6 @@ def main():
             start_pos = np.array([min_x+2.0, min_y+2.0])
             current_pos = start_pos
             
-            # Chỉ tạo goal mới nếu là map mới
             if new_map or (goal_pos[0]==0 and goal_pos[1]==0):
                 goal_pos = get_valid_goal_pos(outer_poly, real_holes)
         else: SCALE = 1.0; current_pos = np.array([2.,2.]); goal_pos = np.array([90.,90.])
@@ -382,7 +393,8 @@ def main():
         rrt_path = []; rrt_vis = None; mcpp_vis = None
         
         finished = False; data_saved = False; finish_cooldown = 0
-        collisions_count = 0; start_time = time.time()
+        collisions_count = 0; final_time = 0
+        start_time = time.time() 
 
     reset_sim(new_map=True)
 
@@ -418,14 +430,13 @@ def main():
         if not finished and outer_poly:
             elapsed_time = time.time() - start_time
             
-            # --- 1. KIỂM TRA ĐẾN ĐÍCH ---
+            # --- 1. KIỂM TRA ĐẾN ĐÍCH & GHI FILE ---
             if dist(current_pos, goal_pos) < 3.0:
                 finished = True
-                
-                # CHẠY TỐI ƯU HÓA NGAY LẬP TỨC
+                final_time = elapsed_time
+
                 if not optimized_path:
-                    print("Goal Reached! Optimizing path...")
-                    # Dùng real_holes để tối ưu (Ground Truth optimization)
+                    print(f"Goal Reached in {final_time:.2f}s! Optimizing path...")
                     optimized_path = optimize_path(path_history, outer_poly, real_holes)
                     
                     l_old = calculate_path_len(path_history)
@@ -433,11 +444,23 @@ def main():
                     imp = (l_old - l_new) / l_old * 100 if l_old > 0 else 0
                     
                     if not data_saved:
-                        with open(csv_file, 'a', newline='') as f:
-                            csv.writer(f).writerow([
-                                os.path.basename(map_folders[current_map_idx]),
-                                algo_mode, f"{l_old:.2f}", f"{l_new:.2f}", f"{imp:.2f}", collisions_count
-                            ])
+                        try:
+                            # Mode 'a' (append) sẽ tự động ghi nối tiếp vào cuối file
+                            with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+                                writer = csv.writer(f)
+                                writer.writerow([
+                                    os.path.basename(map_folders[current_map_idx]),
+                                    algo_mode,
+                                    f"{final_time:.4f}",
+                                    f"{l_old:.2f}",
+                                    f"{l_new:.2f}",
+                                    f"{imp:.2f}",
+                                    collisions_count
+                                ])
+                            print(f"--> [SAVED] Dữ liệu đã được nối vào: {csv_file}")
+                        except Exception as e:
+                            print(f"--> [ERROR] Không thể ghi file: {e}")
+
                         data_saved = True
                         finish_cooldown = pygame.time.get_ticks()
 
@@ -509,37 +532,34 @@ def main():
         pygame.draw.circle(screen, BLUE, to_scr(goal_pos), 8)
         
         # DRAW PATHS
-        # 1. Đường thô (Đen -> Xám khi xong)
         if len(path_history)>1:
             col = (180,180,180) if finished else BLACK
             pygame.draw.lines(screen, col, False, [to_scr(p) for p in path_history], 3)
         
-        # 2. ĐƯỜNG TỐI ƯU (Tím Đậm)
         if finished and len(optimized_path)>1:
             pygame.draw.lines(screen, MAGENTA, False, [to_scr(p) for p in optimized_path], 4)
             for p in optimized_path: pygame.draw.circle(screen, MAGENTA, to_scr(p), 4)
 
         pygame.draw.circle(screen, BLACK, to_scr(current_pos), 6)
 
-        # GUI
+        # GUI INFO
         mname = os.path.basename(map_folders[current_map_idx])
         screen.blit(font_big.render(f"Map: {mname}", True, BLACK), (10, 10))
         screen.blit(font.render(f"Mode: {algo_mode}", True, BLUE), (10, 40))
         
         if finished:
-            l_old = calculate_path_len(path_history)
             l_new = calculate_path_len(optimized_path)
-            imp = (l_old - l_new) / l_old * 100 if l_old > 0 else 0
-            screen.blit(font.render(f"Raw: {l_old:.1f}m | Opt: {l_new:.1f}m", True, BLACK), (10, 70))
-            screen.blit(font.render(f"Better: {imp:.1f}%", True, GREEN), (10, 90))
-            screen.blit(font.render("DONE - PRESS 'N'", True, RED), (10, 120))
+            screen.blit(font.render(f"Time: {final_time:.2f}s", True, RED), (10, 70))
+            screen.blit(font.render(f"Opt Dist: {l_new:.1f}m", True, BLACK), (10, 90))
+            screen.blit(font.render("DONE - PRESS 'N' to Next", True, GREEN), (10, 120))
         else:
-            screen.blit(font.render("RUNNING...", True, GREEN), (10, 70))
+            screen.blit(font.render(f"Time: {elapsed_time:.1f}s", True, BLACK), (10, 70))
+            screen.blit(font.render("RUNNING...", True, GREEN), (10, 90))
 
         pygame.display.flip()
 
     pygame.quit()
     sys.exit()
-
+    
 if __name__ == "__main__":
     main()

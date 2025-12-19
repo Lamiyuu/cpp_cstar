@@ -10,33 +10,26 @@ import itertools
 # --- CẤU HÌNH ---
 WINDOW_SIZE = 900
 FPS = 60
-DATASET_DIR = "AC300"    # Thư mục chứa map
-GROWTH_SPEED = 50        # Tốc độ mọc cây
+DATASET_DIR = "AC300"
+GROWTH_SPEED = 50
 NUM_GOALS = 5
-SENSOR_RADIUS = 60.0     # Bán kính cảm biến
+SENSOR_RADIUS = 60.0
 
 # --- BẢNG MÀU ---
 WHITE = (255, 255, 255)
 BLACK = (0, 0, 0)
 
-# MÀU CHƯỚNG NGẠI VẬT
-OBSTACLE_HIDDEN = (245, 245, 245) # Tàng hình (hòa vào nền)
-OBSTACLE_LIT = (255, 50, 50)      # Đỏ sáng (Khi phát hiện)
-OBSTACLE_OUTLINE = (220, 220, 220)# Viền mờ
+OBSTACLE_HIDDEN = (245, 245, 245)
+OBSTACLE_LIT = (255, 50, 50)
+OBSTACLE_OUTLINE = (220, 220, 220)
 
-# MÀU ĐƯỜNG ĐI
 TREE_PALETTE = [
-    (0, 180, 0),    # Tree 0 (Start) - Xanh lá
-    (0, 0, 255),    # Tree 1 - Xanh dương
-    (148, 0, 211),  # Tree 2 - Tím
-    (255, 140, 0),  # Tree 3 - Cam
-    (0, 150, 150),  # Tree 4 - Teal
-    (139, 69, 19),  # Tree 5 - Nâu
-    (255, 20, 147), # Tree 6 - Hồng
+    (0, 150, 0), (0, 0, 200), (120, 0, 180), 
+    (200, 100, 0), (0, 120, 120), (100, 50, 10), (200, 10, 100)
 ]
-GRAPH_EDGE_COLOR = (80, 80, 80)   # Xám đậm (Cạnh nối các cây)
-FINAL_PATH_COLOR = (255, 0, 0)    # ĐỎ TƯƠI (Đường TSP cuối cùng)
-SHORTCUT_COLOR = (255, 215, 0)    # VÀNG (Đường tắt)
+GRAPH_EDGE_COLOR = (200, 200, 200) # Làm mờ đường RRT gốc đi
+FINAL_PATH_COLOR = (255, 0, 0)     # Đỏ: Đường RRT thô (Zigzag)
+SMOOTH_PATH_COLOR = (50, 255, 50)  # XANH LÁ: Đường đã tối ưu (Thẳng tắp)
 
 RRT_STEP_LEN = 5.0
 RRT_GOAL_SAMPLE_RATE = 0.05
@@ -55,7 +48,7 @@ def point_in_polygon(point, polygon):
     return inside
 
 def check_line_collision(p1, p2, outer, holes, step=5.0):
-    """Kiểm tra va chạm cho đường thẳng (Shortcut)"""
+    """Kiểm tra va chạm đoạn thẳng"""
     distance = np.linalg.norm(p2 - p1)
     if distance < 1e-3: return False
     num_steps = int(distance / step) + 1
@@ -107,7 +100,7 @@ def get_valid_random_pos(outer_poly, holes):
         if valid: return cand
     return np.array([50.0, 50.0])
 
-# --- LOGIC CHÍNH: RRT + SENSING + TSP ---
+# --- MAIN CLASS ---
 class MultiTreeExplorer:
     class Node:
         def __init__(self, x, y):
@@ -116,7 +109,6 @@ class MultiTreeExplorer:
     def __init__(self, start, goals, outer, holes, bounds):
         self.outer = outer
         self.holes = holes
-        # Trạng thái phát hiện hố (False = Ẩn, True = Hiện)
         self.discovered_holes = [False] * len(holes)
         
         self.min_x, self.max_x, self.min_y, self.max_y = bounds
@@ -135,22 +127,17 @@ class MultiTreeExplorer:
         # TSP Variables
         self.tsp_path_calculated = False
         self.tsp_sequence = []     
-        self.final_tour_points = []
-        self.used_shortcuts = 0
+        self.raw_tour_points = []    # Đường RRT thô (Zigzag)
+        self.smooth_tour_points = [] # Đường đã làm mượt (Optimized)
 
     def check_collision_and_sense(self, x, y):
-        """Vừa check va chạm, vừa bật sáng chướng ngại vật"""
         pt = (x, y)
         if not point_in_polygon(pt, self.outer): return True
-        
         collision = False
         for i, h in enumerate(self.holes):
-            # 1. Va chạm trực tiếp
             if point_in_polygon(pt, h):
                 self.discovered_holes[i] = True 
                 collision = True
-            
-            # 2. Cảm biến từ xa
             if not self.discovered_holes[i]:
                 for vert in h:
                     if (vert[0]-x)**2 + (vert[1]-y)**2 < SENSOR_RADIUS**2:
@@ -228,7 +215,7 @@ class MultiTreeExplorer:
     def step(self):
         if all(self.goals_status):
             if not self.tsp_path_calculated:
-                self.solve_tsp_with_shortcuts()
+                self.solve_tsp_and_smooth()
             return
             
         active_trees = [0] + [i+1 for i, v in enumerate(self.goals_status) if not v]
@@ -258,38 +245,60 @@ class MultiTreeExplorer:
         segment_2 = path_b[common_len:]
         return list(segment_1) + list(segment_2)
 
-    def solve_tsp_with_shortcuts(self):
+    # --- HÀM MỚI: PATH SMOOTHING (LÀM MƯỢT) ---
+    def smooth_path(self, path):
+        """
+        Cắt tỉa các đỉnh thừa.
+        Nếu điểm A nhìn thấy điểm C thì bỏ qua B.
+        """
+        if len(path) < 3: return path
+        
+        new_path = [path[0]]
+        current_idx = 0
+        
+        while current_idx < len(path) - 1:
+            # Nhìn xa nhất có thể từ điểm hiện tại
+            # Tìm điểm xa nhất (gần cuối list) mà current_idx có thể nối thẳng tới
+            next_idx = current_idx + 1
+            best_idx = next_idx
+            
+            # Duyệt ngược từ cuối về
+            for i in range(len(path)-1, current_idx, -1):
+                # Kiểm tra va chạm đoạn thẳng
+                if not check_line_collision(path[current_idx], path[i], self.outer, self.holes):
+                    best_idx = i
+                    break
+            
+            new_path.append(path[best_idx])
+            current_idx = best_idx
+            
+        return new_path
+
+    def solve_tsp_and_smooth(self):
         goal_indices = list(range(len(self.goals)))
         all_indices = [-1] + goal_indices
         best_paths = {}; costs = {}
         
-        # Tính toán ma trận khoảng cách (RRT vs Shortcut)
+        # 1. Tính toán mọi cặp đường đi
         for i in range(len(all_indices)):
             for j in range(i + 1, len(all_indices)):
                 u, v = all_indices[i], all_indices[j]
                 
-                # 1. Đường RRT an toàn
+                # Lấy đường RRT thô
                 rrt_path = self.get_rrt_path_between(u, v)
-                rrt_len = self.calculate_path_length(rrt_path)
                 
-                pos_u = self.start_pos if u == -1 else self.goals[u]
-                pos_v = self.start_pos if v == -1 else self.goals[v]
-                direct_len = np.linalg.norm(pos_u - pos_v)
+                # Cố gắng làm mượt ngay lập tức đoạn này
+                # (Để TSP có trọng số chính xác hơn là trọng số zigzag)
+                optimized_segment = self.smooth_path(rrt_path)
                 
-                final_path = rrt_path; final_len = rrt_len
+                seg_len = self.calculate_path_length(optimized_segment)
                 
-                # 2. Thử Shortcut (đường thẳng)
-                # Chỉ được đi tắt nếu đường thẳng KHÔNG cắt vật cản
-                if not check_line_collision(pos_u, pos_v, self.outer, self.holes):
-                    final_path = [pos_u, pos_v]
-                    final_len = direct_len
-                
-                best_paths[(u, v)] = final_path
-                best_paths[(v, u)] = final_path[::-1]
-                costs[(u, v)] = final_len
-                costs[(v, u)] = final_len
+                best_paths[(u, v)] = optimized_segment
+                best_paths[(v, u)] = optimized_segment[::-1]
+                costs[(u, v)] = seg_len
+                costs[(v, u)] = seg_len
 
-        # Giải TSP Brute Force
+        # 2. Giải TSP
         min_total_dist = float('inf')
         best_perm = None
         
@@ -303,38 +312,47 @@ class MultiTreeExplorer:
 
         self.tsp_sequence = best_perm
         
-        # Xây dựng đường đi cuối cùng
-        full_tour = []
+        # 3. Ghép đường đi thô (để so sánh) & đường đi mượt (để hiển thị đẹp)
+        full_tour_smooth = []
+        
+        # Start -> First
         path = best_paths[(-1, best_perm[0])]
-        full_tour.extend(path)
+        full_tour_smooth.extend(path)
         
         for i in range(len(best_perm) - 1):
             u, v = best_perm[i], best_perm[i+1]
             path = best_paths[(u, v)]
-            full_tour.extend(path[1:])
+            full_tour_smooth.extend(path[1:]) # Skip điểm đầu trùng
             
-        self.final_tour_points = full_tour
+        self.smooth_tour_points = full_tour_smooth
+        
+        # Lấy bản RRT gốc (để vẽ màu đỏ làm nền)
+        raw_tour = []
+        p0 = self.get_rrt_path_between(-1, best_perm[0])
+        raw_tour.extend(p0)
+        for i in range(len(best_perm) - 1):
+            p_next = self.get_rrt_path_between(best_perm[i], best_perm[i+1])
+            raw_tour.extend(p_next[1:])
+        self.raw_tour_points = raw_tour
+
         self.tsp_path_calculated = True
 
-# --- MAIN PROGRAM ---
+# --- MAIN ---
 def main():
     global GROWTH_SPEED
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
-    pygame.display.set_caption("Multi-Goal RRT & TSP Exploration")
+    pygame.display.set_caption("RRT Zigzag vs Smoothed Path")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Arial", 14)
     font_big = pygame.font.SysFont("Arial", 20, bold=True)
 
-    # 1. LOAD MAP FOLDERS
     map_folders = sorted(glob.glob(os.path.join(DATASET_DIR, "AC10_*")))
-    
-    # Dummy data fallback
     dummy_outer = [(0,0), (WINDOW_SIZE,0), (WINDOW_SIZE,WINDOW_SIZE), (0,WINDOW_SIZE)]
+    # Map có khe hẹp để test khả năng làm mượt
     dummy_holes = [
-       [(300, 200), (600, 200), (600, 250), (300, 250)], 
-       [(300, 550), (600, 550), (600, 600), (300, 600)],
-       [(400, 350), (450, 350), (450, 450), (400, 450)] 
+       [(200, 300), (400, 300), (400, 500), (200, 500)], # Khối vuông lớn
+       [(500, 100), (550, 100), (550, 600), (500, 600)], # Tường dài
     ]
 
     planner = None
@@ -345,12 +363,9 @@ def main():
     def reset_sim():
         nonlocal planner, outer_poly, holes, scale, start_pos, goal_positions
         use_dummy = False
-        
         if map_folders and current_map_idx < len(map_folders):
             try:
-                folder = map_folders[current_map_idx]
-                print(f"Loading map: {folder}")
-                outer_poly, holes = load_data(folder)
+                outer_poly, holes = load_data(map_folders[current_map_idx])
                 if not outer_poly: use_dummy = True
             except: use_dummy = True
         else: use_dummy = True
@@ -376,66 +391,62 @@ def main():
         for event in pygame.event.get():
             if event.type == pygame.QUIT: running = False
             elif event.type == pygame.KEYDOWN:
-                # --- XỬ LÝ CHUYỂN MAP ---
-                if event.key == pygame.K_n: # Next Map
-                    if map_folders: 
-                        current_map_idx = (current_map_idx + 1) % len(map_folders)
-                        reset_sim()
-                elif event.key == pygame.K_p: # Previous Map
-                    if map_folders:
-                        current_map_idx = (current_map_idx - 1) % len(map_folders)
-                        reset_sim()
-                elif event.key == pygame.K_r: # Reset Current
-                    reset_sim()
+                if event.key == pygame.K_n: 
+                    if map_folders: current_map_idx = (current_map_idx + 1) % len(map_folders); reset_sim()
+                elif event.key == pygame.K_p: 
+                    if map_folders: current_map_idx = (current_map_idx - 1) % len(map_folders); reset_sim()
+                elif event.key == pygame.K_r: reset_sim()
 
         if planner:
             for _ in range(GROWTH_SPEED): planner.step()
 
         screen.fill(WHITE)
 
-        # 1. VẼ MAP & CHƯỚNG NGẠI VẬT (SENSING)
+        # 1. Vẽ Map & Sensing
         for i, h in enumerate(holes):
             scr_h = [to_scr(p) for p in h]
             if planner and planner.discovered_holes[i]:
-                pygame.draw.polygon(screen, OBSTACLE_LIT, scr_h) # Sáng đỏ
+                pygame.draw.polygon(screen, OBSTACLE_LIT, scr_h)
             else:
-                pygame.draw.polygon(screen, OBSTACLE_HIDDEN, scr_h) # Ẩn (Xám nhạt)
-                pygame.draw.polygon(screen, OBSTACLE_OUTLINE, scr_h, 1) # Viền mờ
-        
+                pygame.draw.polygon(screen, OBSTACLE_HIDDEN, scr_h)
+                pygame.draw.polygon(screen, OBSTACLE_OUTLINE, scr_h, 1)
         if outer_poly: pygame.draw.polygon(screen, (50,50,50), [to_scr(p) for p in outer_poly], 2)
 
         if planner:
-            # 2. VẼ CÂY RRT (NHIỀU MÀU)
+            # 2. Vẽ Cây RRT (Mờ)
             for tid, nodes in planner.trees.items():
                 color = TREE_PALETTE[tid % len(TREE_PALETTE)]
                 for node in nodes:
                     if node.parent:
                         pygame.draw.line(screen, color, to_scr((node.parent.x, node.parent.y)), to_scr((node.x, node.y)), 1)
 
-            # 3. VẼ CẠNH ĐỒ THỊ (XÁM ĐẬM)
+            # 3. Vẽ Graph Edges (Kết nối thô giữa các cây)
             if not planner.tsp_path_calculated:
                 for idx, path in planner.found_paths.items():
                     if len(path) > 1:
                         scr_path = [to_scr(p) for p in path]
                         pygame.draw.lines(screen, GRAPH_EDGE_COLOR, False, scr_path, 2)
 
-            # 4. VẼ FINAL TSP PATH (ĐỎ + VÀNG)
-            if planner.tsp_path_calculated and len(planner.final_tour_points) > 1:
-                scr_tour = [to_scr(p) for p in planner.final_tour_points]
+            # 4. FINAL RESULT
+            if planner.tsp_path_calculated:
+                # A. Đường đỏ: RRT gốc (Zigzag)
+                if len(planner.raw_tour_points) > 1:
+                    scr_raw = [to_scr(p) for p in planner.raw_tour_points]
+                    pygame.draw.lines(screen, FINAL_PATH_COLOR, False, scr_raw, 2)
                 
-                # Viền đen
-                pygame.draw.lines(screen, BLACK, False, scr_tour, 8)
-                # Đường chính ĐỎ
-                pygame.draw.lines(screen, FINAL_PATH_COLOR, False, scr_tour, 4)
+                # B. Đường Xanh Lá: Đã tối ưu (Thẳng tắp)
+                if len(planner.smooth_tour_points) > 1:
+                    scr_smooth = [to_scr(p) for p in planner.smooth_tour_points]
+                    # Vẽ viền đen cho nổi
+                    pygame.draw.lines(screen, BLACK, False, scr_smooth, 8)
+                    # Vẽ lõi xanh
+                    pygame.draw.lines(screen, SMOOTH_PATH_COLOR, False, scr_smooth, 4)
+                    
+                    # Vẽ các điểm chốt (Vertices) của đường mới
+                    for p in scr_smooth:
+                        pygame.draw.circle(screen, BLACK, p, 3)
 
-                # Đường Shortcut VÀNG
-                for k in range(len(scr_tour)-1):
-                    p1 = scr_tour[k]; p2 = scr_tour[k+1]
-                    dist_px = math.hypot(p1[0]-p2[0], p1[1]-p2[1])
-                    if dist_px > (RRT_STEP_LEN * scale * 1.5): 
-                        pygame.draw.line(screen, SHORTCUT_COLOR, p1, p2, 4)
-
-                # Đánh số thứ tự
+                # Order Numbers
                 for order, goal_idx in enumerate(planner.tsp_sequence):
                     pos = goal_positions[goal_idx]
                     txt_surf = font_big.render(str(order + 1), True, BLACK)
@@ -443,22 +454,16 @@ def main():
                     pygame.draw.rect(screen, WHITE, txt_rect.inflate(4,4))
                     screen.blit(txt_surf, txt_rect)
 
-        # Draw Points
+        # Start/Goals
         pygame.draw.circle(screen, TREE_PALETTE[0], to_scr(start_pos), 8)
         for i, g in enumerate(goal_positions):
             color = TREE_PALETTE[(i+1) % len(TREE_PALETTE)]
             pygame.draw.circle(screen, color, to_scr(g), 8)
-        
-        # Info UI
-        map_name = "Dummy Map"
-        if map_folders and current_map_idx < len(map_folders):
-            map_name = os.path.basename(map_folders[current_map_idx])
-            
-        screen.blit(font.render(f"Map: {map_name} | [N] Next | [P] Prev | [R] Reset", True, BLACK), (10, 10))
-        status = "Scanning..."
-        if planner and planner.tsp_path_calculated: status = "TSP OPTIMIZED!"
-        screen.blit(font.render(status, True, BLACK), (10, 30))
 
+        status = "Building..."
+        if planner and planner.tsp_path_calculated: status = "RED: Raw RRT | GREEN: Optimized Path"
+        screen.blit(font.render(status, True, BLACK), (10, 10))
+        
         pygame.display.flip()
         clock.tick(FPS)
 

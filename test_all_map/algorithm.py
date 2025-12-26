@@ -26,10 +26,15 @@ RRT_MAX_ITER = 1000     # Số lần thử tối đa mỗi lần Re-plan
 RRT_GOAL_SAMPLE_RATE = 0.1
 
 # 2. MCPP
-MCPP_EPSILON = 5.0
+MCPP_ITER = 2000        # Tăng số bước lặp vì map nhỏ cần tìm kỹ
+MCPP_DEPTH = 40         # Tăng độ sâu tìm kiếm
 MCPP_C = 1.414
-MCPP_ITER = 1000
-MCPP_DEPTH = 30
+
+# --- CẤU HÌNH BỔ SUNG CHO GRID STRATEGY ---
+MCPP_GRID_SIZE = 8.0   # Kích thước ô lưới (khoảng 1/8 bản đồ)
+MCPP_MAX_DENSITY = 6    # Ngưỡng mật độ thấp hơn vì ô lưới nhỏ
+MCPP_EPSILON = 5.0      # Bước đi nhỏ bình thường
+MCPP_ESCAPE_STEP = 6.0  # Bước đi lớn khi cần thoát đám đông
 
 # Màu sắc
 WHITE = (255, 255, 255)
@@ -183,6 +188,24 @@ class MCPP_Planner:
         self.goal = goal
         self.outer = outer
         self.known_holes = known_holes
+        
+        # [MỚI] Lưu dữ liệu lưới: Key=(ix, iy), Value={'count': int, 'sum_pos': np.array}
+        # Dùng để tính vị trí trung bình của đám đông trong ô
+        self.grid_data = {}
+        self.update_grid(start)
+
+    # Lấy tọa độ lưới (ix, iy)
+    def get_grid_idx(self, pos):
+        return (int(pos[0] // MCPP_GRID_SIZE), int(pos[1] // MCPP_GRID_SIZE))
+
+    # [MỚI] Cập nhật thông tin ô lưới (số lượng và tổng vị trí)
+    def update_grid(self, pos):
+        idx = self.get_grid_idx(pos)
+        if idx not in self.grid_data:
+            self.grid_data[idx] = {'count': 0, 'sum_pos': np.array([0.0, 0.0])}
+        
+        self.grid_data[idx]['count'] += 1
+        self.grid_data[idx]['sum_pos'] += pos
 
     def is_valid(self, pos):
         if not point_in_polygon(pos, self.outer): return False
@@ -198,18 +221,52 @@ class MCPP_Planner:
             if s > best_s: best_s = s; best_a = (a, q)
         return best_a
 
+    # --- HÀM EXPAND CẢI TIẾN ---
+    # --- HÀM EXPAND (PHIÊN BẢN PANIC JUMP) ---
     def expand(self, v):
+        grid_idx = self.get_grid_idx(v.state)
+        data = self.grid_data.get(grid_idx)
+        
+        density = data['count'] if data else 0
+        
+        # [LOGIC MỚI] XỬ LÝ KHI BỊ KẸT (Panic Mode)
+        if density > MCPP_MAX_DENSITY:
+            # Thay vì tính toán vector, ta thử random nhiều lần để tìm KHE HỞ
+            # Thử tối đa 15 lần tìm một bước nhảy dài hợp lệ
+            for _ in range(15):
+                ang = random.uniform(0, 2*math.pi)
+                # Random độ dài bước nhảy từ khoảng 5.0 đến ESCAPE_STEP
+                # Để tạo sự đa dạng, không bị cố định vòng tròn
+                r = random.uniform(MCPP_ESCAPE_STEP * 0.5, MCPP_ESCAPE_STEP)
+                
+                nxt = v.state + np.array([r*math.cos(ang), r*math.sin(ang)])
+                
+                # Nếu tìm thấy một điểm hợp lệ (không đâm tường) -> CHỐT NGAY
+                if self.is_valid(nxt):
+                    act = tuple(nxt)
+                    if act not in v.children: v.children[act] = self.QNode(v, act)
+                    return act
+            
+            # Nếu thử 15 lần mà vẫn không thoát được (kẹt quá chặt),
+            # code sẽ tự rơi xuống phần dưới để đi bước nhỏ (chấp nhận số phận tạm thời)
+
+        # [LOGIC BÌNH THƯỜNG] Đi bước nhỏ thám hiểm
+        # Chỉ chạy xuống đây nếu chưa bị kẹt hoặc không tìm được đường thoát xa
         ang = random.uniform(0, 2*math.pi)
         r = random.uniform(1.0, MCPP_EPSILON)
+
         nxt = v.state + np.array([r*math.cos(ang), r*math.sin(ang)])
+        
         if not self.is_valid(nxt): return None
+        
         act = tuple(nxt)
         if act not in v.children: v.children[act] = self.QNode(v, act)
         return act
 
     def sim_v(self, v, d):
         if d==0 or dist(v.state, self.goal)<2.0: return -dist(v.state, self.goal)
-        if len(v.children)<8:
+        # Tăng số con tối đa lên một chút để tận dụng việc mở rộng
+        if len(v.children) < 10:
             act = self.expand(v)
             if act: return self.sim_q(v.children[act], d)
         if not v.children: return -dist(v.state, self.goal)
@@ -217,8 +274,13 @@ class MCPP_Planner:
         return self.sim_q(q, d)
 
     def sim_q(self, q, d):
-        if not q.child_v: q.child_v = self.VNode(np.array(q.action)); return -dist(q.child_v.state, self.goal)
-        r = -dist(q.parent.state, np.array(q.action)) + self.sim_v(q.child_v, d-1) # Gamma=1
+        if not q.child_v: 
+            q.child_v = self.VNode(np.array(q.action))
+            # [QUAN TRỌNG] Cập nhật lưới khi node mới được tạo
+            self.update_grid(q.child_v.state)
+            return -dist(q.child_v.state, self.goal)
+            
+        r = -dist(q.parent.state, np.array(q.action)) + self.sim_v(q.child_v, d-1) 
         q.n+=1; q.cum_r+=r; q.Q=q.cum_r/q.n
         q.parent.N+=1
         return r
@@ -271,18 +333,91 @@ def get_valid_goal_pos(outer_poly, holes):
             
     # Nếu xui quá không tìm được (map quá đặc), trả về giữa bản đồ
     return np.array([(min_x+max_x)/2, (min_y+max_y)/2])   
+def on_segment(p, a, b):
+    """Kiểm tra điểm p có nằm trên đoạn thẳng ab không"""
+    return (p[0] <= max(a[0], b[0]) and p[0] >= min(a[0], b[0]) and
+            p[1] <= max(a[1], b[1]) and p[1] >= min(a[1], b[1]))
 
+def orientation(p, q, r):
+    """
+    Tìm hướng của bộ 3 điểm (p, q, r).
+    0: Thẳng hàng
+    1: Cùng chiều kim đồng hồ (Clockwise)
+    2: Ngược chiều kim đồng hồ (Counter-clockwise)
+    """
+    val = (q[1] - p[1]) * (r[0] - q[0]) - (q[0] - p[0]) * (r[1] - q[1])
+    if val == 0: return 0
+    return 1 if val > 0 else 2
+
+def segments_intersect(p1, q1, p2, q2):
+    """
+    Kiểm tra đoạn thẳng p1q1 có cắt đoạn thẳng p2q2 không.
+    Đây là thuật toán tiêu chuẩn để check va chạm cạnh.
+    """
+    o1 = orientation(p1, q1, p2)
+    o2 = orientation(p1, q1, q2)
+    o3 = orientation(p2, q2, p1)
+    o4 = orientation(p2, q2, q1)
+
+    # Trường hợp chung (General case)
+    if o1 != o2 and o3 != o4:
+        return True
+
+    # Trường hợp đặc biệt (Special Cases - điểm nằm trên đoạn thẳng)
+    if o1 == 0 and on_segment(p2, p1, q1): return True
+    if o2 == 0 and on_segment(q2, p1, q1): return True
+    if o3 == 0 and on_segment(p1, p2, q2): return True
+    if o4 == 0 and on_segment(q1, p2, q2): return True
+
+    return False
+
+def check_polygon_edge_collision(p1, p2, polygon):
+    """
+    Kiểm tra xem đoạn p1-p2 có cắt bất kỳ CẠNH nào của polygon không.
+    """
+    n = len(polygon)
+    for i in range(n):
+        # Lấy cạnh thứ i của đa giác
+        v1 = np.array(polygon[i])
+        v2 = np.array(polygon[(i + 1) % n]) # Nối điểm cuối về điểm đầu
+        
+        # Kiểm tra giao cắt 2 đoạn thẳng
+        if segments_intersect(p1, p2, v1, v2):
+            return True
+    return False
 def check_line_collision(p1, p2, outer, holes):
-    """Kiểm tra va chạm đoạn thẳng (cho việc tối ưu)"""
-    d = dist(p1, p2)
-    if d == 0: return False
-    steps = int(d / 1.0) + 1 
-    for i in range(steps + 1):
-        t = i / steps
-        pt = p1 + (p2 - p1) * t
-        if not point_in_polygon(pt, outer): return True
-        for h in holes:
-            if point_in_polygon(pt, h): return True
+    """
+    Hàm kiểm tra va chạm siêu bền vững (Robust).
+    Kết hợp cả sampling và toán học giao cắt.
+    """
+    # 1. Kiểm tra nhanh: Nếu 2 điểm quá gần nhau, coi như không va chạm
+    if dist(p1, p2) < 1.0: return False
+
+    # 2. KIỂM TRA GIAO CẮT CẠNH (Edge Intersection) - Bắt buộc cho Holes
+    # Nếu đường đi cắt qua bất kỳ cạnh nào của bất kỳ lỗ nào -> VA CHẠM
+    for h in holes:
+        if check_polygon_edge_collision(p1, p2, h):
+            return True # Cắt xuyên qua tường -> Lỗi
+
+    # 3. KIỂM TRA GIAO CẮT VỚI OUTER (Biên giới hạn)
+    # Đường đi không được cắt biên ngoài (trừ khi start/end nằm trên biên)
+    # Tuy nhiên, với outer, ta thường muốn đường đi nằm TRONG. 
+    # Nếu nó cắt cạnh outer, nghĩa là nó đi ra ngoài.
+    if check_polygon_edge_collision(p1, p2, outer):
+        return True
+
+    # 4. KIỂM TRA ĐIỂM GIỮA (Midpoint Safety)
+    # Phòng trường hợp đường thẳng nằm trọn vẹn bên trong một vật cản lớn 
+    # mà không cắt cạnh nào (hiếm gặp nhưng có thể).
+    midpoint = (p1 + p2) / 2
+    
+    # Kiểm tra midpoint có nằm trong hole nào không
+    for h in holes:
+        if point_in_polygon(midpoint, h): return True
+        
+    # Kiểm tra midpoint có nằm ngoài outer không
+    if not point_in_polygon(midpoint, outer): return True
+
     return False
 
 def optimize_path(path, outer, holes):

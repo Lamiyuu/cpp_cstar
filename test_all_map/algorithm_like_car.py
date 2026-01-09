@@ -11,23 +11,24 @@ import pygame
 # ==========================================
 # 1. CẤU HÌNH & THAM SỐ
 # ==========================================
-WINDOW_SIZE = 900
+WINDOW_SIZE = 700
 FPS = 60
 DATASET_DIR = "AC300"
 RESULT_DIR = "Results"
 
 # --- THÔNG SỐ XE (KINEMATIC) ---
 CAR_L = 3.0           # Chiều dài cơ sở
-CAR_WIDTH = 1.2       
-MAX_STEER = 0.6       # ~35 độ
-VELOCITY = 5.0        
+CAR_WIDTH = 1.5       
+MAX_STEER = 0.6       # ~40 độ
+VELOCITY_MAX = 5.0    
+VELOCITY_MIN = 2.0    # Tốc độ lùi/cua gắt
 DT = 0.2              
 SIM_TIME = 1.0        
 
 # --- THÔNG SỐ DUBINS ---
 MIN_TURN_RADIUS = CAR_L / math.tan(MAX_STEER)
-DUBINS_STEP_SIZE = VELOCITY * DT 
-DUBINS_CONNECT_DIST = 30.0 
+DUBINS_STEP_SIZE = VELOCITY_MAX * DT 
+DUBINS_CONNECT_DIST = 50.0 
 
 # --- THÔNG SỐ ĐÍCH ---
 GOAL_RADIUS = 2.0     
@@ -38,6 +39,7 @@ LOOKAHEAD_STEPS = 5
 # --- THAM SỐ THUẬT TOÁN ---
 RRT_MAX_ITER = 5000   
 RRT_GOAL_PROB = 0.05  
+PROB_REVERSE = 0.3    # 30% tỷ lệ đi lùi
 
 MCPP_EPSILON = 5.0    
 MCPP_C = 1.414        
@@ -52,13 +54,12 @@ CAR_COLOR = (50, 50, 200)
 LOOKAHEAD_COLOR = (255, 140, 0) 
 GHOST_GRAY = (245, 245, 245)
 DUBINS_COLOR = (180, 0, 180) # TÍM
+REVERSE_COLOR = (255, 100, 0) # CAM
 
 # ==========================================
 # 2. HÀM HÌNH HỌC & DUBINS
 # ==========================================
-# --- SỬA LỖI TẠI ĐÂY: ĐỊNH NGHĨA HÀM CHUẨN HÓA GÓC ---
 def normalize_angle(angle):
-    """Chuẩn hóa góc về khoảng [-pi, pi]"""
     return (angle + math.pi) % (2 * math.pi) - math.pi
 
 def mod2pi(theta): 
@@ -173,10 +174,10 @@ def generate_dubins_points(path, c, sx, sy, syaw):
         phys_steer = math.atan(CAR_L / c) * steer
         
         for _ in range(n_steps):
-            curr_x += VELOCITY * math.cos(curr_yaw) * (step/VELOCITY)
-            curr_y += VELOCITY * math.sin(curr_yaw) * (step/VELOCITY)
+            curr_x += VELOCITY_MAX * math.cos(curr_yaw) * (step/VELOCITY_MAX)
+            curr_y += VELOCITY_MAX * math.sin(curr_yaw) * (step/VELOCITY_MAX)
             if mode != 'S':
-                curr_yaw += (VELOCITY / CAR_L) * math.tan(phys_steer) * (step/VELOCITY)
+                curr_yaw += (VELOCITY_MAX / CAR_L) * math.tan(phys_steer) * (step/VELOCITY_MAX)
             px.append(curr_x); py.append(curr_y); pyaw.append(curr_yaw)
     return px, py, pyaw
 
@@ -245,14 +246,20 @@ def check_path_collision(path_x, path_y, path_yaw, outer, holes):
         if collided: return True
     return False
 
-def simulate_step(x, y, yaw, steer, sim_time=SIM_TIME):
+# --- SIMULATE CÓ DIRECTION ---
+def simulate_step(x, y, yaw, steer, direction, sim_time=SIM_TIME):
     path_x, path_y, path_yaw = [x], [y], [yaw]
     steps = int(sim_time / DT)
+    
+    base_vel = VELOCITY_MIN if direction == -1 else VELOCITY_MAX
+    steer_factor = abs(steer) / MAX_STEER
+    current_vel = base_vel * (1.0 - 0.5 * steer_factor)
+    v = current_vel * direction
+
     for _ in range(steps):
-        x += VELOCITY * math.cos(yaw) * DT
-        y += VELOCITY * math.sin(yaw) * DT
-        yaw += (VELOCITY / CAR_L) * math.tan(steer) * DT
-        # SỬ DỤNG HÀM ĐÃ ĐỊNH NGHĨA
+        x += v * math.cos(yaw) * DT
+        y += v * math.sin(yaw) * DT
+        yaw += (v / CAR_L) * math.tan(steer) * DT
         yaw = normalize_angle(yaw)
         path_x.append(x); path_y.append(y); path_yaw.append(yaw)
     return x, y, yaw, path_x, path_y, path_yaw
@@ -261,13 +268,14 @@ def simulate_step(x, y, yaw, steer, sim_time=SIM_TIME):
 # 4. PLANNERS
 # ==========================================
 class Node:
-    def __init__(self, x, y, yaw, parent=None, is_dubins=False):
+    def __init__(self, x, y, yaw, parent=None, is_dubins=False, direction=1):
         self.x = x; self.y = y; self.yaw = yaw
         self.parent = parent
         self.path_x = []; self.path_y = []; self.path_yaw = []
-        self.is_dubins = is_dubins # Cờ đánh dấu đường Dubins
+        self.is_dubins = is_dubins
+        self.direction = direction
 
-# --- A. KINEMATIC RRT + DUBINS ---
+# --- A. KINEMATIC RRT + DUBINS + REVERSE ---
 class KinematicRRT:
     def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, bounds):
         self.start = Node(start[0], start[1], start[2])
@@ -283,17 +291,27 @@ class KinematicRRT:
         dists = [(node.x - rnd[0])**2 + (node.y - rnd[1])**2 for node in self.node_list]
         nearest = self.node_list[dists.index(min(dists))]
         
-        target_yaw = math.atan2(rnd[1] - nearest.y, rnd[0] - nearest.x)
-        diff = normalize_angle(target_yaw - nearest.yaw)
+        dx = rnd[0] - nearest.x; dy = rnd[1] - nearest.y
+        target_yaw = math.atan2(dy, dx)
+        
+        diff_head = normalize_angle(target_yaw - nearest.yaw)
+        diff_tail = normalize_angle(target_yaw - (nearest.yaw + math.pi))
+        
+        direction = 1
+        if random.random() < PROB_REVERSE: 
+            direction = -1; diff = diff_tail
+        else: 
+            direction = 1; diff = diff_head
+            
         steer = max(-MAX_STEER, min(MAX_STEER, diff))
-        nx, ny, nyaw, px, py, pyaw = simulate_step(nearest.x, nearest.y, nearest.yaw, steer)
+        nx, ny, nyaw, px, py, pyaw = simulate_step(nearest.x, nearest.y, nearest.yaw, steer, direction)
         
         if not check_path_collision(px, py, pyaw, self.outer, self.known_holes):
-            new_node = Node(nx, ny, nyaw, nearest, is_dubins=False)
+            new_node = Node(nx, ny, nyaw, nearest, is_dubins=False, direction=direction)
             new_node.path_x = px; new_node.path_y = py; new_node.path_yaw = pyaw
             self.node_list.append(new_node)
             
-            # TRY DUBINS CONNECT
+            # DUBINS CONNECT
             if dist((nx, ny), self.goal_pos) <= DUBINS_CONNECT_DIST:
                 dpath = dubins_path_planning(nx, ny, nyaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
                 if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes):
@@ -301,7 +319,6 @@ class KinematicRRT:
                     goal_node.path_x = dpath.x; goal_node.path_y = dpath.y; goal_node.path_yaw = dpath.yaw
                     return self.extract_path(goal_node)
             
-            # Normal Goal Check
             if dist((nx, ny), self.goal_pos) < GOAL_RADIUS:
                 return self.extract_path(new_node)
         return None
@@ -310,20 +327,22 @@ class KinematicRRT:
         full_path = []
         while node.parent:
             points = list(zip(node.path_x, node.path_y, node.path_yaw))
-            segment = {'points': points, 'is_dubins': node.is_dubins}
+            segment = {'points': points, 'is_dubins': node.is_dubins, 'direction': node.direction}
             full_path.insert(0, segment)
             node = node.parent
         return full_path
 
-# --- B. KINEMATIC MCPP + DUBINS ---
+# --- B. KINEMATIC MCPP + DUBINS + REVERSE ---
 class KinematicMCPP:
+    # --- FIX LỖI TẠI ĐÂY: Thêm self.direction vào VNode ---
     class VNode: 
-        def __init__(self, state, is_dubins=False):
+        def __init__(self, state, is_dubins=False, direction=1):
             self.state = state 
             self.N = 0; self.children = {}
             self.parent_node = None
             self.path_x = []; self.path_y = []; self.path_yaw = []
             self.is_dubins = is_dubins
+            self.direction = direction # Đã thêm direction
     
     class QNode: 
         def __init__(self, parent, action):
@@ -346,9 +365,12 @@ class KinematicMCPP:
 
     def expand(self, v):
         steer = random.uniform(-MAX_STEER, MAX_STEER)
-        nx, ny, nyaw, px, py, pyaw = simulate_step(v.state[0], v.state[1], v.state[2], steer)
+        direction = -1 if random.random() < PROB_REVERSE else 1
+        nx, ny, nyaw, px, py, pyaw = simulate_step(v.state[0], v.state[1], v.state[2], steer, direction)
+        
         if check_path_collision(px, py, pyaw, self.outer, self.known_holes): return None
-        action_key = round(steer, 2)
+        
+        action_key = (round(steer, 2), direction)
         if action_key not in v.children:
             qnode = self.QNode(v, action_key)
             v.children[action_key] = qnode
@@ -356,7 +378,7 @@ class KinematicMCPP:
         return None
 
     def sim_v(self, v, d):
-        # 1. DUBINS SHOT
+        # Dubins
         if dist(v.state[:2], self.goal_pos) < DUBINS_CONNECT_DIST:
             dpath = dubins_path_planning(v.state[0], v.state[1], v.state[2], self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
             if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes):
@@ -379,16 +401,21 @@ class KinematicMCPP:
         return self.sim_q(q, d)
 
     def sim_q(self, q, d):
+        steer, direction = q.action
         if not q.child_v:
-            nx, ny, nyaw, px, py, pyaw = simulate_step(q.parent.state[0], q.parent.state[1], q.parent.state[2], q.action)
-            q.child_v = self.VNode((nx, ny, nyaw), is_dubins=False)
+            nx, ny, nyaw, px, py, pyaw = simulate_step(q.parent.state[0], q.parent.state[1], q.parent.state[2], steer, direction)
+            # Tạo VNode con, lưu direction
+            q.child_v = self.VNode((nx, ny, nyaw), is_dubins=False, direction=direction)
             q.child_v.parent_node = q.parent
             q.child_v.path_x = px; q.child_v.path_y = py; q.child_v.path_yaw = pyaw 
             self.node_list.append(q.child_v)
             
+            # Rollout
             curr_state = (nx, ny, nyaw)
             for _ in range(5): 
-                rx, ry, ryaw, rpx, rpy, rpyaw = simulate_step(curr_state[0], curr_state[1], curr_state[2], random.uniform(-MAX_STEER, MAX_STEER))
+                r_steer = random.uniform(-MAX_STEER, MAX_STEER)
+                r_dir = -1 if random.random() < PROB_REVERSE else 1
+                rx, ry, ryaw, rpx, rpy, rpyaw = simulate_step(curr_state[0], curr_state[1], curr_state[2], r_steer, r_dir)
                 if check_path_collision(rpx, rpy, rpyaw, self.outer, self.known_holes): break
                 curr_state = (rx, ry, ryaw)
             return -dist(curr_state[:2], self.goal_pos)
@@ -408,7 +435,9 @@ class KinematicMCPP:
         full_path = []
         while node.parent_node:
             points = list(zip(node.path_x, node.path_y, node.path_yaw))
-            segment = {'points': points, 'is_dubins': node.is_dubins}
+            # FIX: Lấy direction an toàn bằng getattr
+            d = getattr(node, 'direction', 1)
+            segment = {'points': points, 'is_dubins': node.is_dubins, 'direction': d}
             full_path.insert(0, segment)
             node = node.parent_node
         return full_path
@@ -420,11 +449,11 @@ def main():
     pygame.init()
     if not os.path.exists("Results"): os.makedirs("Results")
     screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
-    pygame.display.set_caption("Kinematic RRT/MCPP + Colored Dubins")
+    pygame.display.set_caption("Kinematic RRT/MCPP + Dubins + Reverse + Colors")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Consolas", 16)
 
-    map_folders = sorted(glob.glob(os.path.join(DATASET_DIR, "AC10_*")))
+    map_folders = sorted(glob.glob(os.path.join(DATASET_DIR, "AC11_*")))
     
     current_map_idx = 0
     algo_mode = "RRT"
@@ -434,12 +463,8 @@ def main():
     goal_pos = np.array([0, 0]); goal_yaw = 0.0
     planner = None
     
-    # planned_path bây giờ là list các segment: [{'points':..., 'is_dubins':...}, ...]
-    planned_path = [] 
-    flat_planned_path = [] # Để xe chạy
-    path_index = 0
+    planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
     is_planning = True
-    path_history = []
     scale = 1.0
 
     def reset_sim(new_map=False):
@@ -511,11 +536,9 @@ def main():
                 path_segments = planner.plan_step()
                 if path_segments:
                     planned_path = path_segments
-                    # Flatten path cho xe chạy
                     flat_planned_path = []
                     for seg in path_segments:
                         flat_planned_path.extend(seg['points'])
-                    
                     is_planning = False
                     path_index = 0
                     print("Path Found!")
@@ -527,7 +550,6 @@ def main():
                 reset_sim(False) 
 
         elif flat_planned_path and path_index < len(flat_planned_path):
-            # MOVE & LOOKAHEAD
             collision_detected = False
             look_limit = min(path_index + LOOKAHEAD_STEPS, len(flat_planned_path))
             
@@ -561,7 +583,6 @@ def main():
             col = RED if i in known_hole_indices else GHOST_GRAY
             pygame.draw.polygon(screen, col, [to_scr(p) for p in h])
 
-        # Draw Tree (Faded)
         if is_planning:
             for node in planner.node_list:
                 parent = getattr(node, 'parent', None) or getattr(node, 'parent_node', None)
@@ -569,17 +590,15 @@ def main():
                     pts = [to_scr((px, py)) for px, py in zip(node.path_x, node.path_y)]
                     if len(pts)>1: pygame.draw.lines(screen, (200, 200, 255), False, pts, 1)
 
-        # Draw Path (VỚI PHÂN BIỆT MÀU DUBINS)
         if not is_planning and planned_path:
-            current_idx_counter = 0
             for seg in planned_path:
                 points = seg['points']
-                seg_len = len(points)
                 if len(points) > 1:
                     pts_scr = [to_scr((p[0], p[1])) for p in points]
-                    col = DUBINS_COLOR if seg['is_dubins'] else GREEN
-                    width = 4 if seg['is_dubins'] else 2
-                    pygame.draw.lines(screen, col, False, pts_scr, width)
+                    if seg['is_dubins']: col = DUBINS_COLOR; w = 4
+                    elif seg['direction'] == -1: col = REVERSE_COLOR; w = 2
+                    else: col = GREEN; w = 2
+                    pygame.draw.lines(screen, col, False, pts_scr, w)
 
         if len(path_history) > 1:
             pygame.draw.lines(screen, BLACK, False, [to_scr(p) for p in path_history], 1)
@@ -595,7 +614,7 @@ def main():
         status = "PLANNING..." if is_planning else "MOVING"
         if not is_planning and dist(current_state[:2], goal_pos) < GOAL_RADIUS: status = "FINISHED"
         screen.blit(font.render(f"Status: {status}", True, RED if is_planning else GREEN), (10, 30))
-        screen.blit(font.render("GREEN: RRT Path | PURPLE: Dubins Path", True, BLACK), (10, 50))
+        screen.blit(font.render("GREEN: Fwd | ORANGE: Rev | PURPLE: Dubins", True, BLACK), (10, 50))
         
         pygame.display.flip()
 

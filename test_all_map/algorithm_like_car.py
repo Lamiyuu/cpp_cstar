@@ -28,7 +28,7 @@ SIM_TIME = 1.0
 # --- THÔNG SỐ DUBINS ---
 MIN_TURN_RADIUS = CAR_L / math.tan(MAX_STEER)
 DUBINS_STEP_SIZE = VELOCITY_MAX * DT 
-DUBINS_CONNECT_DIST = 50.0 
+DUBINS_CONNECT_DIST = 20.0 
 
 # --- THÔNG SỐ ĐÍCH ---
 GOAL_RADIUS = 3.0     
@@ -85,102 +85,164 @@ def point_in_polygon(point, polygon):
     return inside
 
 # --- DUBINS LOGIC ---
-class DubinsPath:
-    def __init__(self, t, p, q, length, mode):
-        self.t = t; self.p = p; self.q = q
-        self.length = length; self.mode = mode
-        self.x = []; self.y = []; self.yaw = []
+# --- BỘ GIẢI REEDS-SHEPP TỐI ƯU (46 MẪU RÚT GỌN) ---
+class RSPath:
+    def __init__(self, lengths, modes, total_len):
+        self.lengths = lengths  # Số âm là đi lùi
+        self.modes = modes      
+        self.length = total_len
+        self.x, self.y, self.yaw = [], [], []
 
-def dubins_path_planning(sx, sy, syaw, ex, ey, eyaw, c):
-    ex = ex - sx; ey = ey - sy
-    lex = math.cos(-syaw) * ex - math.sin(-syaw) * ey
-    ley = math.cos(-syaw) * ey + math.sin(-syaw) * ex
-    leyaw = mod2pi(eyaw - syaw)
-    D = math.sqrt(lex**2 + ley**2); d = D / c
-    theta = mod2pi(math.atan2(ley, lex))
-    alpha = mod2pi(-theta); beta = mod2pi(leyaw - theta)
-
-    planners = [LSL, RSR, LSR, RSL, RLR, LRL]
-    best_path = None; min_len = float('inf')
-
-    for planner in planners:
-        res = planner(alpha, beta, d)
-        if res:
-            t, p, q, mode = res
-            length = (abs(t) + abs(p) + abs(q)) * c
-            if length < min_len:
-                min_len = length
-                best_path = DubinsPath(t, p, q, length, mode)
-    
-    if best_path:
-        px, py, pyaw = generate_dubins_points(best_path, c, sx, sy, syaw)
-        best_path.x = px; best_path.y = py; best_path.yaw = pyaw
-        return best_path
-    return None
-
-def LSL(alpha, beta, d): 
-    sa = math.sin(alpha); sb = math.sin(beta); ca = math.cos(alpha); cb = math.cos(beta)
-    p_sq = 2 + d*d - (2*math.cos(alpha - beta)) + (2*d*(sa - sb))
+def LSL(a, b, d):
+    sa, sb, ca, cb = math.sin(a), math.sin(b), math.cos(a), math.cos(b)
+    p_sq = 2 + d*d - (2*math.cos(a - b)) + (2*d*(sa - sb))
     if p_sq < 0: return None
     tmp = math.atan2((cb - ca), (d + sa - sb))
-    return mod2pi(-alpha + tmp), math.sqrt(p_sq), mod2pi(beta - tmp), ["L","S","L"]
-def RSR(alpha, beta, d):
-    sa = math.sin(alpha); sb = math.sin(beta); ca = math.cos(alpha); cb = math.cos(beta)
-    p_sq = 2 + d*d - (2*math.cos(alpha - beta)) + (2*d*(sb - sa))
+    return mod2pi(-a + tmp), math.sqrt(p_sq), mod2pi(b - tmp), ["L", "S", "L"]
+
+def RSR(a, b, d):
+    sa, sb, ca, cb = math.sin(a), math.sin(b), math.cos(a), math.cos(b)
+    p_sq = 2 + d*d - (2*math.cos(a - b)) + (2*d*(sb - sa))
     if p_sq < 0: return None
     tmp = math.atan2((ca - cb), (d - sa + sb))
-    return mod2pi(alpha - tmp), math.sqrt(p_sq), mod2pi(-beta + tmp), ["R","S","R"]
-def LSR(alpha, beta, d):
-    sa = math.sin(alpha); sb = math.sin(beta); ca = math.cos(alpha); cb = math.cos(beta)
-    p_sq = -2 + d*d + (2*math.cos(alpha - beta)) + (2*d*(sa + sb))
+    return mod2pi(a - tmp), math.sqrt(p_sq), mod2pi(-b + tmp), ["R", "S", "R"]
+
+def LSR(a, b, d):
+    sa, sb, ca, cb = math.sin(a), math.sin(b), math.cos(a), math.cos(b)
+    p_sq = -2 + d*d + (2*math.cos(a - b)) + (2*d*(sa + sb))
     if p_sq < 0: return None
     p = math.sqrt(p_sq)
     tmp = math.atan2((-ca - cb), (d + sa + sb)) - math.atan2(-2.0, p)
-    return mod2pi(-alpha + tmp), p, mod2pi(-mod2pi(beta) + tmp), ["L","S","R"]
-def RSL(alpha, beta, d):
-    sa = math.sin(alpha); sb = math.sin(beta); ca = math.cos(alpha); cb = math.cos(beta)
-    p_sq = (d*d) - 2 + (2*math.cos(alpha - beta)) - (2*d*(sa + sb))
+    return mod2pi(-a + tmp), p, mod2pi(-mod2pi(b) + tmp), ["L", "S", "R"]
+
+def RSL(a, b, d):
+    sa, sb, ca, cb = math.sin(a), math.sin(b), math.cos(a), math.cos(b)
+    p_sq = d*d - 2 + (2*math.cos(a - b)) - (2*d*(sa + sb))
     if p_sq < 0: return None
     p = math.sqrt(p_sq)
     tmp = math.atan2((ca + cb), (d - sa - sb)) - math.atan2(2.0, p)
-    return mod2pi(alpha - tmp), p, mod2pi(beta - tmp), ["R","S","L"]
-def RLR(alpha, beta, d):
-    sa = math.sin(alpha); sb = math.sin(beta); ca = math.cos(alpha); cb = math.cos(beta)
-    tmp = (6.0 - d*d + 2.0*math.cos(alpha - beta) + 2.0*d*(sa - sb)) / 8.0
-    if abs(tmp) > 1.0: return None
-    p = mod2pi(2 * math.pi - math.acos(tmp))
-    t = mod2pi(alpha - math.atan2(ca - cb, d - sa + sb) + mod2pi(p / 2.0))
-    q = mod2pi(alpha - beta - t + mod2pi(p))
-    return t, p, q, ["R","L","R"]
-def LRL(alpha, beta, d):
-    sa = math.sin(alpha); sb = math.sin(beta); ca = math.cos(alpha); cb = math.cos(beta)
-    tmp = (6.0 - d*d + 2.0*math.cos(alpha - beta) + 2.0*d*(sb - sa)) / 8.0
-    if abs(tmp) > 1.0: return None
-    p = mod2pi(2 * math.pi - math.acos(tmp))
-    t = mod2pi(-alpha - math.atan2(ca - cb, d + sa - sb) + p / 2.0)
-    q = mod2pi(mod2pi(beta) - alpha - t + mod2pi(p))
-    return t, p, q, ["L","R","L"]
+    return mod2pi(a - tmp), p, mod2pi(b - tmp), ["R", "S", "L"]
 
-def generate_dubins_points(path, c, sx, sy, syaw):
-    px, py, pyaw = [sx], [sy], [syaw]
-    lengths = [path.t, path.p, path.q]
-    step = DUBINS_STEP_SIZE
-    curr_yaw = syaw; curr_x = sx; curr_y = sy
+def CCC_FBF(alpha, beta, d):
+    # Đưa về hệ tọa độ chuẩn (0,0,0) -> (x, y, phi)
+    x = d * math.cos(alpha)
+    y = -d * math.sin(alpha)
+    phi = normalize_angle(beta - alpha)
     
-    for i, mode in enumerate(path.mode):
-        seg_len = lengths[i] * c
-        n_steps = int(seg_len / step)
-        steer = 1 if mode == 'L' else (-1 if mode == 'R' else 0)
-        phys_steer = math.atan(CAR_L / c) * steer
-        
-        for _ in range(n_steps):
-            curr_x += VELOCITY_MAX * math.cos(curr_yaw) * (step/VELOCITY_MAX)
-            curr_y += VELOCITY_MAX * math.sin(curr_yaw) * (step/VELOCITY_MAX)
-            if mode != 'S':
-                curr_yaw += (VELOCITY_MAX / CAR_L) * math.tan(phys_steer) * (step/VELOCITY_MAX)
-            px.append(curr_x); py.append(curr_y); pyaw.append(curr_yaw)
-    return px, py, pyaw
+    best_t, best_p, best_q, best_mode = None, None, None, None
+    min_len = float('inf')
 
+    # Hàm nội bộ tính CỰC KỲ CHÍNH XÁC cho mẫu L+ R- L+
+    def calc_LRL(X, Y, PHI):
+        u1 = math.sqrt((X - math.sin(PHI))**2 + (Y - 1.0 + math.cos(PHI))**2)
+        if u1 <= 4.0:
+            P = -2.0 * math.asin(0.25 * u1)
+            T = mod2pi(math.atan2(Y - 1.0 + math.cos(PHI), X - math.sin(PHI)) + 0.5 * P + math.pi)
+            Q = mod2pi(PHI - T + P)
+            return T, P, Q
+        return None
+
+    # 1. Kiểm tra mẫu L+ R- L+
+    res_LRL = calc_LRL(x, y, phi)
+    if res_LRL:
+        t, p, q = res_LRL
+        l = abs(t) + abs(p) + abs(q)
+        if l < min_len:
+            min_len = l
+            best_t, best_p, best_q, best_mode = t, p, q, ["L", "R", "L"]
+
+    # 2. Kiểm tra mẫu R+ L- R+ (Dùng tính chất đối xứng: Lật trục Y và góc Phi)
+    res_RLR = calc_LRL(x, -y, -phi)
+    if res_RLR:
+        t, p, q = res_RLR
+        l = abs(t) + abs(p) + abs(q)
+        if l < min_len:
+            best_t, best_p, best_q, best_mode = t, p, q, ["R", "L", "R"]
+
+    if best_mode:
+        return best_t, best_p, best_q, best_mode
+    return None
+
+def reeds_shepp_planning(sx, sy, syaw, ex, ey, eyaw, c):
+    dx = ex - sx
+    dy = ey - sy
+    
+    # BÍ QUYẾT TỐI THƯỢNG: Ma trận chuyển đổi Hệ Pygame sang Hệ Toán Học
+    lex = math.cos(syaw) * dx + math.sin(syaw) * dy
+    ley = math.sin(syaw) * dx - math.cos(syaw) * dy  # Trục Y Pygame cần công thức này để hết bị soi gương
+    leyaw = normalize_angle(-(eyaw - syaw)) # Đảo dấu góc đích để khớp hệ tọa độ
+    
+    # Chuẩn hóa khoảng cách
+    D = math.sqrt(lex**2 + ley**2)
+    d = D / c 
+    phi = math.atan2(ley, lex)
+    
+    alpha = normalize_angle(-phi)
+    beta = normalize_angle(leyaw - phi)
+
+    best_p = None; min_l = float('inf')
+    
+    def flip_modes(modes):
+        return ["R" if m == "L" else ("L" if m == "R" else "S") for m in modes]
+
+    # 4 Phép đối xứng Toán học chuẩn
+    symmetries = [
+        (alpha, beta, False, False), 
+        (normalize_angle(-alpha - math.pi), normalize_angle(-beta - math.pi), True, False), 
+        (normalize_angle(-alpha), normalize_angle(-beta), False, True), 
+        (normalize_angle(alpha + math.pi), normalize_angle(beta + math.pi), True, True) 
+    ]
+    
+    # Quét các mẫu cơ sở
+    for f in [LSL, RSR, LSR, RSL, CCC_FBF]:
+        for a, b, is_timeflip, is_reflect in symmetries:
+            res = f(a, b, d)
+            if res:
+                t, p, q, m = res
+                if is_timeflip: t, p, q = -t, -p, -q
+                if is_reflect: m = flip_modes(m)
+                    
+                l = (abs(t) + abs(p) + abs(q)) * c
+                
+                # NGĂN CHẶN "VẼ VÒNG KHỔNG LỒ": Từ chối các quỹ đạo dài vô lý
+                # Nếu đường đi gấp 3 lần khoảng cách thực + 25m dự phòng xoay sở, thì bỏ qua!
+                if l < min_l and l < (D * 3.0 + 25.0): 
+                    min_l = l
+                    best_p = RSPath([t, p, q], m, l)
+
+    if best_p:
+        # Nội suy và trả về
+        best_p.x, best_p.y, best_p.yaw = generate_rs_points(best_p, c, sx, sy, syaw)
+        return best_p
+    return None
+
+def generate_rs_points(path, c, sx, sy, syaw):
+    px, py, pyaw = [sx], [sy], [syaw]
+    cx, cy, cyaw = sx, sy, syaw
+    
+    for i, mode in enumerate(path.modes):
+        L = path.lengths[i] * c
+        gear = 1 if L >= 0 else -1
+        abs_L = abs(L)
+        
+        step = 0.1 
+        n = max(1, int(abs_L / step))
+        d_step = abs_L / n
+        
+        # CHÚ Ý QUAN TRỌNG NHẤT: Lật ngược vô lăng để bù trừ hệ trục của Pygame
+        # Trong Pygame, để rẽ Trái (CCW), góc Yaw phải giảm (-)
+        steer = -1 if mode == 'L' else (1 if mode == 'R' else 0)
+        
+        for _ in range(n):
+            cx += d_step * gear * math.cos(cyaw)
+            cy += d_step * gear * math.sin(cyaw)
+            if mode != 'S':
+                # Nhân thêm gear để lùi bẻ vô lăng đúng vật lý
+                cyaw += (d_step * gear / c) * steer
+            
+            px.append(cx); py.append(cy); pyaw.append(normalize_angle(cyaw))
+            
+    return px, py, pyaw
 # ==========================================
 # 3. MÔI TRƯỜNG & MÔ PHỎNG
 # ==========================================
@@ -313,7 +375,7 @@ class KinematicRRT:
             
             # DUBINS CONNECT
             if dist((nx, ny), self.goal_pos) <= DUBINS_CONNECT_DIST:
-                dpath = dubins_path_planning(nx, ny, nyaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
+                dpath = reeds_shepp_planning(nx, ny, nyaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
                 if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes):
                     goal_node = Node(self.goal_pos[0], self.goal_pos[1], self.goal_yaw, new_node, is_dubins=True)
                     goal_node.path_x = dpath.x; goal_node.path_y = dpath.y; goal_node.path_yaw = dpath.yaw
@@ -396,13 +458,20 @@ class KinematicMCPP:
         return None
 
     def sim_v(self, v, d):
-        # Thử Dubins
-        if dist(v.state[:2], self.goal_pos) < DUBINS_CONNECT_DIST:
-            dpath = dubins_path_planning(v.state[0], v.state[1], v.state[2], self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
+        # Lấy trạng thái hiện tại từ node v
+        sx, sy, syaw = v.state[0], v.state[1], v.state[2]
+        
+        if dist((sx, sy), self.goal_pos) < DUBINS_CONNECT_DIST:
+            # Gọi Reeds-Shepp thay vì Dubins
+            dpath = reeds_shepp_planning(sx, sy, syaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
+            
             if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes):
                 goal_v = self.VNode((self.goal_pos[0], self.goal_pos[1], self.goal_yaw), is_dubins=True)
                 goal_v.parent_node = v
+                # Lưu toàn bộ mảng tọa độ để vẽ
                 goal_v.path_x, goal_v.path_y, goal_v.path_yaw = dpath.x, dpath.y, dpath.yaw
+                # Xác định hướng chủ đạo để vẽ màu (nếu có đoạn lùi thì đánh dấu)
+                goal_v.direction = -1 if any(l < 0 for l in dpath.lengths) else 1
                 self.node_list.append(goal_v) 
                 return 2000.0
 
@@ -472,7 +541,7 @@ def main():
     pygame.init()
     if not os.path.exists("Results"): os.makedirs("Results")
     screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
-    pygame.display.set_caption("Kinematic RRT/MCPP + Dubins + Reverse + Colors")
+    pygame.display.set_caption("Kinematic RRT/MCPP + Click to Start/Goal")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Consolas", 16)
 
@@ -487,12 +556,15 @@ def main():
     planner = None
     
     planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
-    is_planning = True
+    
+    # --- BIẾN ĐIỀU KHIỂN LOGIC CLICK ---
+    click_step = 0 # 0: Đợi Điểm Đầu, 1: Đợi Điểm Đích, 2: Đang Tìm Đường / Chạy
+    is_planning = False
     scale = 1.0
 
     def reset_sim(new_map=False):
         nonlocal outer_poly, real_holes, current_state, goal_pos, goal_yaw, known_hole_indices, planner_holes_geom
-        nonlocal planner, planned_path, flat_planned_path, path_index, is_planning, scale, path_history
+        nonlocal planner, planned_path, flat_planned_path, path_index, is_planning, scale, path_history, click_step
 
         use_dummy = False
         if map_folders:
@@ -509,30 +581,24 @@ def main():
         xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
         mx = max(max(xs), max(ys))
         scale = (WINDOW_SIZE - 80) / mx
-        min_x, min_y = min(xs), min(ys)
         
-        start_pos = np.array([min_x+20.0, min_y+20.0])
-        current_state = (start_pos[0], start_pos[1], 0.0)
-        
-        if new_map or (goal_pos[0]==0):
-            goal_pos = get_valid_random_pos(outer_poly, real_holes, [min_x, max(xs), min_y, max(ys)])
-            goal_yaw = random.uniform(-math.pi, math.pi)
-            
-        bounds = [0, mx, 0, mx]
-        if algo_mode == "RRT":
-            planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
-        else:
-            planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom)
+        # Đưa trạng thái về đợi Click chọn điểm
+        click_step = 0
+        is_planning = False
+        planner = None
+        current_state = (0.0, 0.0, 0.0)
+        goal_pos = np.array([0.0, 0.0])
+        goal_yaw = 0.0
         
         if new_map: 
             known_hole_indices = set(); planner_holes_geom = []
             
         planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
-        is_planning = True
 
     reset_sim(new_map=True)
 
     def to_scr(pos): return int(pos[0]*scale)+40, int(WINDOW_SIZE - (pos[1]*scale)-40)
+    def from_scr(sx, sy): return (sx - 40) / scale, (WINDOW_SIZE - sy - 40) / scale
     
     def draw_car(state, color=CAR_COLOR):
         x, y, yaw = state
@@ -553,8 +619,31 @@ def main():
                     if map_folders: current_map_idx=(current_map_idx+1)%len(map_folders); reset_sim(True)
                 elif event.key == pygame.K_r: reset_sim(False)
                 elif event.key == pygame.K_TAB: algo_mode = "MCPP" if algo_mode == "RRT" else "RRT"; reset_sim(False)
+            
+            # --- XỬ LÝ SỰ KIỆN CLICK CHUỘT ---
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if click_step < 2:
+                    wx, wy = from_scr(event.pos[0], event.pos[1])
+                    if click_step == 0:
+                        # Click lần 1: Chọn Điểm Đầu, mặc định hướng là 0 Radian
+                        current_state = (wx, wy, 0.0) 
+                        click_step = 1
+                    elif click_step == 1:
+                        # Click lần 2: Chọn Điểm Đích, mặc định hướng là 0 Radian
+                        goal_pos = np.array([wx, wy])
+                        goal_yaw = 0.0 
+                        click_step = 2
+                        is_planning = True
+                        
+                        # Chỉ Khởi tạo Planner khi đã có đủ Start và Goal
+                        xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
+                        bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
+                        if algo_mode == "RRT":
+                            planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
+                        else:
+                            planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom)
 
-        if is_planning:
+        if is_planning and click_step == 2:
             for _ in range(20): 
                 path_segments = planner.plan_step()
                 if path_segments:
@@ -572,7 +661,7 @@ def main():
                 print("Retry planning...")
                 reset_sim(False) 
 
-        elif flat_planned_path and path_index < len(flat_planned_path):
+        elif flat_planned_path and path_index < len(flat_planned_path) and click_step == 2:
             collision_detected = False
             look_limit = min(path_index + LOOKAHEAD_STEPS, len(flat_planned_path))
             
@@ -581,32 +670,31 @@ def main():
                 collided, hit_idx = check_collision_with_index(fs[0], fs[1], fs[2], outer_poly, real_holes)
                 if collided:
                     collision_detected = True
-                    # Cập nhật bản đồ vật cản ngay khi nhìn thấy từ xa
                     if hit_idx != -1 and hit_idx not in known_hole_indices:
                         known_hole_indices.add(hit_idx)
                         planner_holes_geom.append(real_holes[hit_idx])
                     break
             
             if collision_detected:
-                # THAY ĐỔI TẠI ĐÂY: Không reset sim hoàn toàn, mà yêu cầu tìm nhánh mới
                 is_planning = True 
-                # Giữ nguyên path_history nhưng xóa con đường cũ đang đi bị kẹt
                 planned_path = []
                 flat_planned_path = []
                 
-                # Khởi tạo lại Planner từ vị trí HIỆN TẠI của xe
-                # Khi này Planner sẽ thấy phía trước có vật cản và tự ưu tiên nhánh lùi (PROB_REVERSE)
+                xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
+                bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
                 if algo_mode == "RRT":
-                    planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, [0, 700, 0, 700])
+                    planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
                 else:
                     planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom)
                 
                 print("Obstacle ahead! Re-routing or reversing...")
             else:
-                # Di chuyển bình thường
-                current_state = flat_planned_path[path_index]
-                path_history.append((current_state[0], current_state[1]))
-                path_index += 1
+                if path_index < len(flat_planned_path):
+                    current_state = flat_planned_path[path_index]
+                    path_history.append((current_state[0], current_state[1]))
+                    path_index += 1
+                else:
+                    current_state = flat_planned_path[-1]
 
         # --- DRAW ---
         screen.fill(WHITE)
@@ -615,14 +703,14 @@ def main():
             col = RED if i in known_hole_indices else GHOST_GRAY
             pygame.draw.polygon(screen, col, [to_scr(p) for p in h])
 
-        if is_planning:
+        if is_planning and click_step == 2:
             for node in planner.node_list:
                 parent = getattr(node, 'parent', None) or getattr(node, 'parent_node', None)
                 if parent:
                     pts = [to_scr((px, py)) for px, py in zip(node.path_x, node.path_y)]
                     if len(pts)>1: pygame.draw.lines(screen, (200, 200, 255), False, pts, 1)
 
-        if not is_planning and planned_path:
+        if not is_planning and planned_path and click_step == 2:
             for seg in planned_path:
                 points = seg['points']
                 if len(points) > 1:
@@ -635,17 +723,40 @@ def main():
         if len(path_history) > 1:
             pygame.draw.lines(screen, BLACK, False, [to_scr(p) for p in path_history], 1)
 
-        g_scr = to_scr(goal_pos)
-        pygame.draw.circle(screen, BLUE, g_scr, int(GOAL_RADIUS * scale))
-        arrow_end = (goal_pos[0] + 4.0*math.cos(goal_yaw), goal_pos[1] + 4.0*math.sin(goal_yaw))
-        pygame.draw.line(screen, BLUE, g_scr, to_scr(arrow_end), 3)
+        # Vẽ điểm Đích nếu đã click
+        if click_step >= 2:
+            g_scr = to_scr(goal_pos)
+            pygame.draw.circle(screen, BLUE, g_scr, int(GOAL_RADIUS * scale))
+            arrow_end = (goal_pos[0] + 4.0*math.cos(goal_yaw), goal_pos[1] + 4.0*math.sin(goal_yaw))
+            pygame.draw.line(screen, BLUE, g_scr, to_scr(arrow_end), 3)
 
-        draw_car(current_state)
+        # Vẽ xe nếu đã click chọn điểm đầu
+        if click_step >= 1:
+            draw_car(current_state)
 
-        screen.blit(font.render(f"Mode: {algo_mode} | [TAB] Switch | [N] Next Map", True, BLUE), (10, 10))
-        status = "PLANNING..." if is_planning else "MOVING"
-        if not is_planning and dist(current_state[:2], goal_pos) < GOAL_RADIUS: status = "FINISHED"
-        screen.blit(font.render(f"Status: {status}", True, RED if is_planning else GREEN), (10, 30))
+        # Giao diện chữ trên màn hình
+        screen.blit(font.render(f"Mode: {algo_mode} | [TAB] Switch | [N] Next Map | [R] Reset Map", True, BLUE), (10, 10))
+        
+        # Logic cập nhật trạng thái UI
+        if click_step == 0:
+            status = "VUI LONG CLICK CHON DIEM DAU"
+            color_st = BLUE
+        elif click_step == 1:
+            status = "VUI LONG CLICK CHON DIEM DICH"
+            color_st = BLUE
+        else:
+            reached_end_of_path = (flat_planned_path and path_index >= len(flat_planned_path))
+            if not is_planning and reached_end_of_path:
+                status = "FINISHED"
+                color_st = GREEN
+            elif is_planning:
+                status = "PLANNING..."
+                color_st = RED
+            else:
+                status = "MOVING"
+                color_st = GREEN
+
+        screen.blit(font.render(f"Status: {status}", True, color_st), (10, 30))
         screen.blit(font.render("GREEN: Fwd | ORANGE: Rev | PURPLE: Dubins", True, BLACK), (10, 50))
         
         pygame.display.flip()

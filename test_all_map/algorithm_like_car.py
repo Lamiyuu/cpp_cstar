@@ -56,6 +56,10 @@ GHOST_GRAY = (245, 245, 245)
 DUBINS_COLOR = (180, 0, 180) # TÍM
 REVERSE_COLOR = (255, 100, 0) # CAM
 
+# --- THAM SỐ GRID SHELL (MCPP) ---
+BIG_GRID_SIZE = 20.0    # Kích thước 1 ô lớn (tùy chỉnh theo bản đồ)
+MAX_STEPS_PER_GRID = 25  # Nếu kẹt trong ô này 50 bước, ép đổi ô khác
+
 # ==========================================
 # 2. HÀM HÌNH HỌC & DUBINS
 # ==========================================
@@ -394,14 +398,13 @@ class KinematicRRT:
             node = node.parent
         return full_path
 
-# --- B. KINEMATIC MCPP + DUBINS + REVERSE ---
+# --- B. KINEMATIC MCPP + DUBINS + REVERSE + GRID SHELL ---
 class KinematicMCPP:
     class VNode: 
         def __init__(self, state, is_dubins=False, direction=1):
             self.state = state 
             self.N = 0; self.children = {}
             self.parent_node = None
-            # QUAN TRỌNG: Giữ các danh sách này để hàm main() có thể vẽ
             self.path_x = []; self.path_y = []; self.path_yaw = []
             self.is_dubins = is_dubins
             self.direction = direction
@@ -411,12 +414,15 @@ class KinematicMCPP:
             self.parent = parent; self.action = action
             self.n = 0; self.Q = 0.0; self.child_v = None
 
-    def __init__(self, start, goal_pos, goal_yaw, outer, known_holes):
+    def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, global_penalties=None):
         self.root = self.VNode(start)
         self.goal_pos = goal_pos; self.goal_yaw = goal_yaw
         self.outer = outer; self.known_holes = known_holes
-        # node_list này chính là danh sách chứa các "đường mảnh" để vẽ
         self.node_list = [self.root]
+        
+        # --- LOGIC GRID SHELL ---
+        self.grid_visits = {}     # Đếm số lượng node sinh ra trong 1 ô lớn
+        self.grid_penalties = global_penalties if global_penalties is not None else {}  # Lưu điểm phạt để trừ vào thuật toán UCB
 
     def get_dist_to_nearest_obstacle(self, state):
         min_d = 50.0 
@@ -431,15 +437,21 @@ class KinematicMCPP:
         best_s = -float('inf'); best_a = None
         for a, q in v.children.items():
             if q.n == 0: return a, q
-            # Tăng C khi gần vật cản để kích thích "tìm hướng khác"
+            # Tăng hằng số C khi gần vật cản
             curr_c = MCPP_C * (1.5 if self.get_dist_to_nearest_obstacle(v.state) < 10.0 else 1.0)
             s = q.Q + curr_c * math.sqrt(math.log(max(1, v.N)) / q.n)
+            
+            # --- ÁP DỤNG PHẠT GRID SHELL ---
+            # Trừ thẳng vào điểm đánh giá để thuật toán "chán" ô này và rẽ đi ô khác
+            if q.child_v:
+                gid = (int(q.child_v.state[0] // BIG_GRID_SIZE), int(q.child_v.state[1] // BIG_GRID_SIZE))
+                s -= self.grid_penalties.get(gid, 0)
+                
             if s > best_s: best_s = s; best_a = (a, q)
         return best_a
 
     def expand(self, v):
         d_obs = self.get_dist_to_nearest_obstacle(v.state)
-        # Né tránh chủ động: Thử các góc lái gắt khi ở gần vật cản
         if d_obs < 15.0:
             steer = random.choice([-MAX_STEER, MAX_STEER, random.uniform(-MAX_STEER, MAX_STEER)])
         else:
@@ -458,19 +470,15 @@ class KinematicMCPP:
         return None
 
     def sim_v(self, v, d):
-        # Lấy trạng thái hiện tại từ node v
         sx, sy, syaw = v.state[0], v.state[1], v.state[2]
         
         if dist((sx, sy), self.goal_pos) < DUBINS_CONNECT_DIST:
-            # Gọi Reeds-Shepp thay vì Dubins
             dpath = reeds_shepp_planning(sx, sy, syaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
             
             if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes):
                 goal_v = self.VNode((self.goal_pos[0], self.goal_pos[1], self.goal_yaw), is_dubins=True)
                 goal_v.parent_node = v
-                # Lưu toàn bộ mảng tọa độ để vẽ
                 goal_v.path_x, goal_v.path_y, goal_v.path_yaw = dpath.x, dpath.y, dpath.yaw
-                # Xác định hướng chủ đạo để vẽ màu (nếu có đoạn lùi thì đánh dấu)
                 goal_v.direction = -1 if any(l < 0 for l in dpath.lengths) else 1
                 self.node_list.append(goal_v) 
                 return 2000.0
@@ -480,7 +488,6 @@ class KinematicMCPP:
             d_obs = self.get_dist_to_nearest_obstacle(v.state)
             return -(1.0 * d_goal) + (2.0 * d_obs if d_obs < 10.0 else 0.5 * d_obs)
 
-        # Dynamic Branching khi gần vật cản
         max_b = MCPP_BRANCHES * (2 if self.get_dist_to_nearest_obstacle(v.state) < 10.0 else 1)
         if len(v.children) < max_b:
             act = self.expand(v)
@@ -499,8 +506,17 @@ class KinematicMCPP:
             q.child_v = self.VNode((nx, ny, nyaw), is_dubins=False, direction=direction)
             q.child_v.parent_node = q.parent
             q.child_v.path_x, q.child_v.path_y, q.child_v.path_yaw = px, py, pyaw
-            # Đưa vào node_list để hàm vẽ có thể truy cập
             self.node_list.append(q.child_v)
+            
+            # --- GRID SHELL: ĐẾM BƯỚC VÀ PHẠT NẾU KẸT ---
+            gid = (int(nx // BIG_GRID_SIZE), int(ny // BIG_GRID_SIZE))
+            self.grid_visits[gid] = self.grid_visits.get(gid, 0) + 1
+            
+            # Nếu thuật toán duyệt vào ô này quá nhiều lần (bị kẹt ở góc chết)
+            if self.grid_visits[gid] > MAX_STEPS_PER_GRID:
+                self.grid_penalties[gid] = self.grid_penalties.get(gid, 0) + 2000.0 # Bơm điểm phạt
+                self.grid_visits[gid] = 0 # Reset lại bộ đếm cho ô này
+                print(f"[MCPP] Ô lớn {gid} có dấu hiệu kẹt! Đang ép chuyển sang ô khác...")
             
             # Rollout đơn giản
             curr = (nx, ny, nyaw)
@@ -515,13 +531,11 @@ class KinematicMCPP:
         return r
 
     def plan_step(self):
-        # Chạy giả lập để xây dựng cây
         for _ in range(MCPP_ITER // 40):
             self.sim_v(self.root, MCPP_DEPTH)
         
-        # Kiểm tra nếu đã chạm đích
         for node in self.node_list:
-            if dist(node.state[:2], self.goal_pos) < GOAL_RADIUS:
+            if dist(node.state[:2], self.goal_pos) < GOAL_RADIUS and abs(normalize_angle(node.state[2] - self.goal_yaw)) < 0.2:
                 return self.extract_path(node)
         return None
 
@@ -533,7 +547,6 @@ class KinematicMCPP:
             full_path.insert(0, {'points': points, 'is_dubins': curr.is_dubins, 'direction': curr.direction})
             curr = curr.parent_node
         return full_path
-
 # ==========================================
 # 5. MAIN LOOP
 # ==========================================
@@ -556,6 +569,8 @@ def main():
     planner = None
     
     planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
+    
+    global_grid_penalties = {}
     
     # --- BIẾN ĐIỀU KHIỂN LOGIC CLICK ---
     click_step = 0 # 0: Đợi Điểm Đầu, 1: Đợi Điểm Đích, 2: Đang Tìm Đường / Chạy
@@ -592,6 +607,7 @@ def main():
         
         if new_map: 
             known_hole_indices = set(); planner_holes_geom = []
+            global_grid_penalties = {} # Reset trí nhớ ô khi sang map mới
             
         planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
 
@@ -680,14 +696,24 @@ def main():
                 planned_path = []
                 flat_planned_path = []
                 
+                # --- LOGIC PHONG TỎA Ô (PROACTIVE GRID BANNING) ---
+                # Khi phát hiện vật cản mới, phạt NẶNG tất cả các Grid Shell chứa vật cản này
+                hit_obstacle = real_holes[hit_idx]
+                for pt in hit_obstacle:
+                    gid = (int(pt[0] // BIG_GRID_SIZE), int(pt[1] // BIG_GRID_SIZE))
+                    # Bơm 5000 điểm phạt vào ô này, MCPP sẽ kinh hãi không dám đi vào
+                    global_grid_penalties[gid] = global_grid_penalties.get(gid, 0) + 5000.0 
+                
                 xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
                 bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
+                
+                # CHUYỀN TRÍ NHỚ TOÀN CỤC VÀO PLANNER MỚI
                 if algo_mode == "RRT":
                     planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
                 else:
-                    planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom)
+                    planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, global_grid_penalties)
                 
-                print("Obstacle ahead! Re-routing or reversing...")
+                print(f"Obstacle ahead! Banned grids around obstacle. Re-routing...")
             else:
                 if path_index < len(flat_planned_path):
                     current_state = flat_planned_path[path_index]

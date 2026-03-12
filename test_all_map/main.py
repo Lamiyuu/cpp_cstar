@@ -98,9 +98,14 @@ def main():
         bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
         safe_car_radius = math.hypot(CAR_L/2 + 1.0, CAR_WIDTH/2)
         
+        # --- XÁC ĐỊNH TRẠNG THÁI VỀ ĐÍCH ---
+        is_finished = (click_step == 2 and not is_planning and flat_planned_path and path_index >= len(flat_planned_path))
+
         # 1. Các quả bóng luôn di chuyển vật lý trong thế giới
         for obs in dyn_obstacles:
-            active_robot_state = current_state if click_step >= 1 else None
+            # Nếu xe đã về đích (is_finished), tắt va chạm vật lý thân xe để không bị bóng quấy rầy
+            # Bóng vẫn sẽ nảy vì đụng phải Vùng Đích Đến (active_goal_pos)
+            active_robot_state = current_state if (click_step >= 1 and not is_finished) else None
             active_goal_pos = goal_pos if click_step >= 2 else None
             obs.move(dt_frame, bounds, outer_poly, real_holes, active_robot_state, safe_car_radius, active_goal_pos, GOAL_RADIUS)
             
@@ -108,7 +113,7 @@ def main():
         # 2. BỘ LỌC CẢM BIẾN (Chỉ nhận diện vật trong Radar)
         # ========================================================
         visible_dyn_obs = []
-        if click_step >= 1:
+        if click_step >= 1 and not is_finished: # Đã về đích thì tắt Radar
             rx, ry = current_state[0], current_state[1]
             for obs in dyn_obstacles:
                 if math.hypot(obs.x - rx, obs.y - ry) <= (SENSOR_RADIUS + obs.radius):
@@ -118,7 +123,7 @@ def main():
         # 3. LÙI KHẨN CẤP (Dùng visible_dyn_obs)
         # ========================================================
         emergency_override = False
-        if click_step >= 1: 
+        if click_step >= 1 and not is_finished: # Khóa Lùi khẩn cấp nếu đã về đích
             hit, h_idx = check_collision_with_index(current_state[0], current_state[1], current_state[2], outer_poly, real_holes, visible_dyn_obs, t_lookahead=0.8)
             if hit and h_idx == -3:
                 emergency_override = True

@@ -47,6 +47,15 @@ MCPP_ITER = 2000
 MCPP_DEPTH = 30       
 MCPP_BRANCHES = 5
 
+# --- THAM SỐ GRID SHELL (MCPP) ---
+BIG_GRID_SIZE = 20.0    # Kích thước 1 ô lớn (tùy chỉnh theo bản đồ)
+MAX_STEPS_PER_GRID = 25  # Nếu kẹt trong ô này 50 bước, ép đổi ô khác
+
+# --- THÔNG SỐ CHƯỚNG NGẠI VẬT ĐỘNG ---
+NUM_DYN_OBS = 6       # Tăng số lượng lên chút cho thú vị
+DYN_OBS_RADIUS = 2.0  # THU BÉ BÓNG LẠI (từ 3.5 xuống 2.0)
+DYN_OBS_SPEED = 12.0  
+
 # MÀU SẮC
 WHITE = (255, 255, 255); BLACK = (0, 0, 0); RED = (255, 0, 0)
 GRAY = (200, 200, 200); GREEN = (0, 200, 0); BLUE = (0, 0, 255)
@@ -55,10 +64,81 @@ LOOKAHEAD_COLOR = (255, 140, 0)
 GHOST_GRAY = (245, 245, 245)
 DUBINS_COLOR = (180, 0, 180) # TÍM
 REVERSE_COLOR = (255, 100, 0) # CAM
+DYN_COLOR = (255, 100, 150) # HỒNG
 
-# --- THAM SỐ GRID SHELL (MCPP) ---
-BIG_GRID_SIZE = 20.0    # Kích thước 1 ô lớn (tùy chỉnh theo bản đồ)
-MAX_STEPS_PER_GRID = 25  # Nếu kẹt trong ô này 50 bước, ép đổi ô khác
+# ==========================================
+# CHƯỚNG NGẠI VẬT ĐỘNG (CLASS TỐI ƯU VẬT LÝ)
+# ==========================================
+class DynamicObstacle:
+    def __init__(self, x, y, radius, vx, vy):
+        self.x = x
+        self.y = y
+        self.radius = radius
+        self.vx = vx
+        self.vy = vy
+
+    def move(self, dt, bounds, outer_poly, holes, robot_state, robot_safe_radius):
+        # Tính vị trí tương lai nếu đi tiếp
+        nx = self.x + self.vx * dt
+        ny = self.y + self.vy * dt
+        
+        # 1. Va chạm viền bản đồ (Bounding Box)
+        min_x, max_x, min_y, max_y = bounds
+        hit_bound = False
+        if nx - self.radius < min_x or nx + self.radius > max_x:
+            self.vx *= -1; hit_bound = True
+        if ny - self.radius < min_y or ny + self.radius > max_y:
+            self.vy *= -1; hit_bound = True
+            
+        if hit_bound:
+            nx = self.x + self.vx * dt
+            ny = self.y + self.vy * dt
+
+        # 2. Va chạm với Đa giác tĩnh (SỬA LỖI LÚN TƯỜNG)
+        hit_solid = False
+        
+        # Tạo 8 điểm cảm biến nằm ngay trên "vỏ" của quả bóng
+        angles = [0, math.pi/4, math.pi/2, 3*math.pi/4, math.pi, 5*math.pi/4, 3*math.pi/2, 7*math.pi/4]
+        check_pts = [(nx + self.radius * math.cos(a), ny + self.radius * math.sin(a)) for a in angles]
+        check_pts.append((nx, ny)) # Thêm cả tâm bóng cho chắc
+        
+        # Quét xem có điểm cảm biến nào lọt vào vật cản tĩnh không
+        for pt in check_pts:
+            if outer_poly and not point_in_polygon(pt, outer_poly): 
+                hit_solid = True
+                break
+            for h in holes:
+                if point_in_polygon(pt, h):
+                    hit_solid = True
+                    break
+            if hit_solid: break
+                    
+        # 3. Check va chạm với Robot (Bóng nảy vào xe)
+        if not hit_solid and robot_state:
+            rx, ry, _ = robot_state
+            # Cộng gộp bán kính bóng và bán kính an toàn của xe
+            if math.hypot(nx - rx, ny - ry) < (self.radius + robot_safe_radius):
+                hit_solid = True
+
+        # --- XỬ LÝ PHẢN XẠ NẾU CÓ VA CHẠM ---
+        if hit_solid:
+            # Đảo ngược lực văng
+            self.vx *= -1
+            self.vy *= -1
+            
+            # Xoay vector vận tốc đi một góc ngẫu nhiên để bóng không bị kẹt lặp lại 1 đường nảy
+            angle = math.atan2(self.vy, self.vx) + random.uniform(-0.5, 0.5)
+            speed = math.hypot(self.vx, self.vy)
+            self.vx = math.cos(angle) * speed
+            self.vy = math.sin(angle) * speed
+            
+            # DỪNG BÓNG TẠI CHỖ 1 FRAME: Điều này rất quan trọng để bóng không tiếp tục lấn tới
+            nx = self.x
+            ny = self.y
+
+        # Chốt vị trí cuối cùng
+        self.x = nx
+        self.y = ny
 
 # ==========================================
 # 2. HÀM HÌNH HỌC & DUBINS
@@ -89,10 +169,9 @@ def point_in_polygon(point, polygon):
     return inside
 
 # --- DUBINS LOGIC ---
-# --- BỘ GIẢI REEDS-SHEPP TỐI ƯU (46 MẪU RÚT GỌN) ---
 class RSPath:
     def __init__(self, lengths, modes, total_len):
-        self.lengths = lengths  # Số âm là đi lùi
+        self.lengths = lengths  
         self.modes = modes      
         self.length = total_len
         self.x, self.y, self.yaw = [], [], []
@@ -128,7 +207,6 @@ def RSL(a, b, d):
     return mod2pi(a - tmp), p, mod2pi(b - tmp), ["R", "S", "L"]
 
 def CCC_FBF(alpha, beta, d):
-    # Đưa về hệ tọa độ chuẩn (0,0,0) -> (x, y, phi)
     x = d * math.cos(alpha)
     y = -d * math.sin(alpha)
     phi = normalize_angle(beta - alpha)
@@ -136,7 +214,6 @@ def CCC_FBF(alpha, beta, d):
     best_t, best_p, best_q, best_mode = None, None, None, None
     min_len = float('inf')
 
-    # Hàm nội bộ tính CỰC KỲ CHÍNH XÁC cho mẫu L+ R- L+
     def calc_LRL(X, Y, PHI):
         u1 = math.sqrt((X - math.sin(PHI))**2 + (Y - 1.0 + math.cos(PHI))**2)
         if u1 <= 4.0:
@@ -146,7 +223,6 @@ def CCC_FBF(alpha, beta, d):
             return T, P, Q
         return None
 
-    # 1. Kiểm tra mẫu L+ R- L+
     res_LRL = calc_LRL(x, y, phi)
     if res_LRL:
         t, p, q = res_LRL
@@ -155,7 +231,6 @@ def CCC_FBF(alpha, beta, d):
             min_len = l
             best_t, best_p, best_q, best_mode = t, p, q, ["L", "R", "L"]
 
-    # 2. Kiểm tra mẫu R+ L- R+ (Dùng tính chất đối xứng: Lật trục Y và góc Phi)
     res_RLR = calc_LRL(x, -y, -phi)
     if res_RLR:
         t, p, q = res_RLR
@@ -171,12 +246,10 @@ def reeds_shepp_planning(sx, sy, syaw, ex, ey, eyaw, c):
     dx = ex - sx
     dy = ey - sy
     
-    # BÍ QUYẾT TỐI THƯỢNG: Ma trận chuyển đổi Hệ Pygame sang Hệ Toán Học
     lex = math.cos(syaw) * dx + math.sin(syaw) * dy
-    ley = math.sin(syaw) * dx - math.cos(syaw) * dy  # Trục Y Pygame cần công thức này để hết bị soi gương
-    leyaw = normalize_angle(-(eyaw - syaw)) # Đảo dấu góc đích để khớp hệ tọa độ
+    ley = math.sin(syaw) * dx - math.cos(syaw) * dy  
+    leyaw = normalize_angle(-(eyaw - syaw)) 
     
-    # Chuẩn hóa khoảng cách
     D = math.sqrt(lex**2 + ley**2)
     d = D / c 
     phi = math.atan2(ley, lex)
@@ -189,7 +262,6 @@ def reeds_shepp_planning(sx, sy, syaw, ex, ey, eyaw, c):
     def flip_modes(modes):
         return ["R" if m == "L" else ("L" if m == "R" else "S") for m in modes]
 
-    # 4 Phép đối xứng Toán học chuẩn
     symmetries = [
         (alpha, beta, False, False), 
         (normalize_angle(-alpha - math.pi), normalize_angle(-beta - math.pi), True, False), 
@@ -197,7 +269,6 @@ def reeds_shepp_planning(sx, sy, syaw, ex, ey, eyaw, c):
         (normalize_angle(alpha + math.pi), normalize_angle(beta + math.pi), True, True) 
     ]
     
-    # Quét các mẫu cơ sở
     for f in [LSL, RSR, LSR, RSL, CCC_FBF]:
         for a, b, is_timeflip, is_reflect in symmetries:
             res = f(a, b, d)
@@ -207,15 +278,11 @@ def reeds_shepp_planning(sx, sy, syaw, ex, ey, eyaw, c):
                 if is_reflect: m = flip_modes(m)
                     
                 l = (abs(t) + abs(p) + abs(q)) * c
-                
-                # NGĂN CHẶN "VẼ VÒNG KHỔNG LỒ": Từ chối các quỹ đạo dài vô lý
-                # Nếu đường đi gấp 3 lần khoảng cách thực + 25m dự phòng xoay sở, thì bỏ qua!
                 if l < min_l and l < (D * 3.0 + 25.0): 
                     min_l = l
                     best_p = RSPath([t, p, q], m, l)
 
     if best_p:
-        # Nội suy và trả về
         best_p.x, best_p.y, best_p.yaw = generate_rs_points(best_p, c, sx, sy, syaw)
         return best_p
     return None
@@ -232,21 +299,18 @@ def generate_rs_points(path, c, sx, sy, syaw):
         step = 0.1 
         n = max(1, int(abs_L / step))
         d_step = abs_L / n
-        
-        # CHÚ Ý QUAN TRỌNG NHẤT: Lật ngược vô lăng để bù trừ hệ trục của Pygame
-        # Trong Pygame, để rẽ Trái (CCW), góc Yaw phải giảm (-)
         steer = -1 if mode == 'L' else (1 if mode == 'R' else 0)
         
         for _ in range(n):
             cx += d_step * gear * math.cos(cyaw)
             cy += d_step * gear * math.sin(cyaw)
             if mode != 'S':
-                # Nhân thêm gear để lùi bẻ vô lăng đúng vật lý
                 cyaw += (d_step * gear / c) * steer
             
             px.append(cx); py.append(cy); pyaw.append(normalize_angle(cyaw))
             
     return px, py, pyaw
+
 # ==========================================
 # 3. MÔI TRƯỜNG & MÔ PHỎNG
 # ==========================================
@@ -297,22 +361,29 @@ def get_car_corners(x, y, yaw):
         world.append((lx*c - ly*s + x, lx*s + ly*c + y))
     return world
 
-def check_collision_with_index(x, y, yaw, outer, holes):
+def check_collision_with_index(x, y, yaw, outer, holes, dyn_obs=None):
     corners = get_car_corners(x, y, yaw)
+    # Va chạm Tĩnh
     for p in corners:
         if outer and not point_in_polygon(p, outer): return True, -1
         for i, h in enumerate(holes):
             if point_in_polygon(p, h): return True, i
+            
+    # Va chạm Động
+    if dyn_obs:
+        safe_radius = math.hypot(CAR_L/2 + 1.0, CAR_WIDTH/2) 
+        for obs in dyn_obs:
+            if math.hypot(x - obs.x, y - obs.y) < obs.radius + safe_radius:
+                return True, -3 
     return False, -2
 
-def check_path_collision(path_x, path_y, path_yaw, outer, holes):
+def check_path_collision(path_x, path_y, path_yaw, outer, holes, dyn_obs=None):
     step = 5 
     for i in range(0, len(path_x), step):
-        collided, _ = check_collision_with_index(path_x[i], path_y[i], path_yaw[i], outer, holes)
+        collided, _ = check_collision_with_index(path_x[i], path_y[i], path_yaw[i], outer, holes, dyn_obs)
         if collided: return True
     return False
 
-# --- SIMULATE CÓ DIRECTION ---
 def simulate_step(x, y, yaw, steer, direction, sim_time=SIM_TIME):
     path_x, path_y, path_yaw = [x], [y], [yaw]
     steps = int(sim_time / DT)
@@ -341,14 +412,14 @@ class Node:
         self.is_dubins = is_dubins
         self.direction = direction
 
-# --- A. KINEMATIC RRT + DUBINS + REVERSE ---
 class KinematicRRT:
-    def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, bounds):
+    def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, bounds, dyn_obs=None):
         self.start = Node(start[0], start[1], start[2])
         self.goal_pos = goal_pos; self.goal_yaw = goal_yaw
         self.outer = outer; self.known_holes = known_holes 
         self.min_x, self.max_x, self.min_y, self.max_y = bounds
         self.node_list = [self.start]
+        self.dyn_obs = dyn_obs 
 
     def plan_step(self):
         if random.random() < RRT_GOAL_PROB: rnd = (self.goal_pos[0], self.goal_pos[1])
@@ -359,7 +430,6 @@ class KinematicRRT:
         
         dx = rnd[0] - nearest.x; dy = rnd[1] - nearest.y
         target_yaw = math.atan2(dy, dx)
-        
         diff_head = normalize_angle(target_yaw - nearest.yaw)
         diff_tail = normalize_angle(target_yaw - (nearest.yaw + math.pi))
         
@@ -372,15 +442,14 @@ class KinematicRRT:
         steer = max(-MAX_STEER, min(MAX_STEER, diff))
         nx, ny, nyaw, px, py, pyaw = simulate_step(nearest.x, nearest.y, nearest.yaw, steer, direction)
         
-        if not check_path_collision(px, py, pyaw, self.outer, self.known_holes):
+        if not check_path_collision(px, py, pyaw, self.outer, self.known_holes, self.dyn_obs):
             new_node = Node(nx, ny, nyaw, nearest, is_dubins=False, direction=direction)
             new_node.path_x = px; new_node.path_y = py; new_node.path_yaw = pyaw
             self.node_list.append(new_node)
             
-            # DUBINS CONNECT
             if dist((nx, ny), self.goal_pos) <= DUBINS_CONNECT_DIST:
                 dpath = reeds_shepp_planning(nx, ny, nyaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
-                if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes):
+                if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes, self.dyn_obs):
                     goal_node = Node(self.goal_pos[0], self.goal_pos[1], self.goal_yaw, new_node, is_dubins=True)
                     goal_node.path_x = dpath.x; goal_node.path_y = dpath.y; goal_node.path_yaw = dpath.yaw
                     return self.extract_path(goal_node)
@@ -398,7 +467,6 @@ class KinematicRRT:
             node = node.parent
         return full_path
 
-# --- B. KINEMATIC MCPP + DUBINS + REVERSE + GRID SHELL ---
 class KinematicMCPP:
     class VNode: 
         def __init__(self, state, is_dubins=False, direction=1):
@@ -414,15 +482,15 @@ class KinematicMCPP:
             self.parent = parent; self.action = action
             self.n = 0; self.Q = 0.0; self.child_v = None
 
-    def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, global_penalties=None):
+    def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, global_penalties=None, dyn_obs=None):
         self.root = self.VNode(start)
         self.goal_pos = goal_pos; self.goal_yaw = goal_yaw
         self.outer = outer; self.known_holes = known_holes
         self.node_list = [self.root]
+        self.dyn_obs = dyn_obs
         
-        # --- LOGIC GRID SHELL ---
-        self.grid_visits = {}     # Đếm số lượng node sinh ra trong 1 ô lớn
-        self.grid_penalties = global_penalties if global_penalties is not None else {}  # Lưu điểm phạt để trừ vào thuật toán UCB
+        self.grid_visits = {}     
+        self.grid_penalties = global_penalties if global_penalties is not None else {} 
 
     def get_dist_to_nearest_obstacle(self, state):
         min_d = 50.0 
@@ -431,18 +499,21 @@ class KinematicMCPP:
             for vertex in hole:
                 d = math.sqrt((px - vertex[0])**2 + (py - vertex[1])**2)
                 if d < min_d: min_d = d
+                
+        # Né tránh bóng động từ xa
+        if self.dyn_obs:
+            for obs in self.dyn_obs:
+                d = math.hypot(px - obs.x, py - obs.y) - obs.radius
+                if d < min_d: min_d = max(0.1, d)
         return min_d
 
     def get_action_ucb(self, v):
         best_s = -float('inf'); best_a = None
         for a, q in v.children.items():
             if q.n == 0: return a, q
-            # Tăng hằng số C khi gần vật cản
             curr_c = MCPP_C * (1.5 if self.get_dist_to_nearest_obstacle(v.state) < 10.0 else 1.0)
             s = q.Q + curr_c * math.sqrt(math.log(max(1, v.N)) / q.n)
             
-            # --- ÁP DỤNG PHẠT GRID SHELL ---
-            # Trừ thẳng vào điểm đánh giá để thuật toán "chán" ô này và rẽ đi ô khác
             if q.child_v:
                 gid = (int(q.child_v.state[0] // BIG_GRID_SIZE), int(q.child_v.state[1] // BIG_GRID_SIZE))
                 s -= self.grid_penalties.get(gid, 0)
@@ -460,7 +531,7 @@ class KinematicMCPP:
         direction = -1 if random.random() < PROB_REVERSE else 1
         nx, ny, nyaw, px, py, pyaw = simulate_step(v.state[0], v.state[1], v.state[2], steer, direction)
         
-        if check_path_collision(px, py, pyaw, self.outer, self.known_holes): return None
+        if check_path_collision(px, py, pyaw, self.outer, self.known_holes, self.dyn_obs): return None
         
         action_key = (round(steer, 2), direction)
         if action_key not in v.children:
@@ -475,7 +546,7 @@ class KinematicMCPP:
         if dist((sx, sy), self.goal_pos) < DUBINS_CONNECT_DIST:
             dpath = reeds_shepp_planning(sx, sy, syaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
             
-            if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes):
+            if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes, self.dyn_obs):
                 goal_v = self.VNode((self.goal_pos[0], self.goal_pos[1], self.goal_yaw), is_dubins=True)
                 goal_v.parent_node = v
                 goal_v.path_x, goal_v.path_y, goal_v.path_yaw = dpath.x, dpath.y, dpath.yaw
@@ -508,21 +579,18 @@ class KinematicMCPP:
             q.child_v.path_x, q.child_v.path_y, q.child_v.path_yaw = px, py, pyaw
             self.node_list.append(q.child_v)
             
-            # --- GRID SHELL: ĐẾM BƯỚC VÀ PHẠT NẾU KẸT ---
             gid = (int(nx // BIG_GRID_SIZE), int(ny // BIG_GRID_SIZE))
             self.grid_visits[gid] = self.grid_visits.get(gid, 0) + 1
             
-            # Nếu thuật toán duyệt vào ô này quá nhiều lần (bị kẹt ở góc chết)
             if self.grid_visits[gid] > MAX_STEPS_PER_GRID:
-                self.grid_penalties[gid] = self.grid_penalties.get(gid, 0) + 2000.0 # Bơm điểm phạt
-                self.grid_visits[gid] = 0 # Reset lại bộ đếm cho ô này
-                print(f"[MCPP] Ô lớn {gid} có dấu hiệu kẹt! Đang ép chuyển sang ô khác...")
+                self.grid_penalties[gid] = self.grid_penalties.get(gid, 0) + 2000.0
+                self.grid_visits[gid] = 0 
             
-            # Rollout đơn giản
             curr = (nx, ny, nyaw)
+            survive_steps = 0
             for _ in range(3):
                 rx, ry, ryaw, rpx, rpy, _ = simulate_step(curr[0], curr[1], curr[2], random.uniform(-MAX_STEER, MAX_STEER), 1)
-                if check_path_collision(rpx, rpy, [0]*len(rpx), self.outer, self.known_holes): break
+                if check_path_collision(rpx, rpy, [0]*len(rpx), self.outer, self.known_holes, self.dyn_obs): break
                 curr = (rx, ry, ryaw)
             return -dist(curr[:2], self.goal_pos) + (0.5 * self.get_dist_to_nearest_obstacle(curr))
 
@@ -547,6 +615,7 @@ class KinematicMCPP:
             full_path.insert(0, {'points': points, 'is_dubins': curr.is_dubins, 'direction': curr.direction})
             curr = curr.parent_node
         return full_path
+
 # ==========================================
 # 5. MAIN LOOP
 # ==========================================
@@ -554,7 +623,7 @@ def main():
     pygame.init()
     if not os.path.exists("Results"): os.makedirs("Results")
     screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
-    pygame.display.set_caption("Kinematic RRT/MCPP + Click to Start/Goal")
+    pygame.display.set_caption("Kinematic Planner + Bouncing Obstacles")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Consolas", 16)
 
@@ -569,17 +638,17 @@ def main():
     planner = None
     
     planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
-    
     global_grid_penalties = {}
+    dyn_obstacles = [] 
     
-    # --- BIẾN ĐIỀU KHIỂN LOGIC CLICK ---
-    click_step = 0 # 0: Đợi Điểm Đầu, 1: Đợi Điểm Đích, 2: Đang Tìm Đường / Chạy
+    click_step = 0 
     is_planning = False
     scale = 1.0
 
     def reset_sim(new_map=False):
         nonlocal outer_poly, real_holes, current_state, goal_pos, goal_yaw, known_hole_indices, planner_holes_geom
         nonlocal planner, planned_path, flat_planned_path, path_index, is_planning, scale, path_history, click_step
+        nonlocal global_grid_penalties, dyn_obstacles
 
         use_dummy = False
         if map_folders:
@@ -597,7 +666,6 @@ def main():
         mx = max(max(xs), max(ys))
         scale = (WINDOW_SIZE - 80) / mx
         
-        # Đưa trạng thái về đợi Click chọn điểm
         click_step = 0
         is_planning = False
         planner = None
@@ -607,7 +675,15 @@ def main():
         
         if new_map: 
             known_hole_indices = set(); planner_holes_geom = []
-            global_grid_penalties = {} # Reset trí nhớ ô khi sang map mới
+            global_grid_penalties = {} 
+            dyn_obstacles.clear()
+            
+            bounds = [0, mx, 0, mx]
+            for _ in range(NUM_DYN_OBS):
+                rp = get_valid_random_pos(outer_poly, real_holes, bounds)
+                angle = random.uniform(0, 2*math.pi)
+                speed = random.uniform(DYN_OBS_SPEED/2, DYN_OBS_SPEED)
+                dyn_obstacles.append(DynamicObstacle(rp[0], rp[1], DYN_OBS_RADIUS, math.cos(angle)*speed, math.sin(angle)*speed))
             
         planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
 
@@ -628,6 +704,20 @@ def main():
     running = True
     while running:
         clock.tick(FPS)
+        dt_frame = 1.0 / FPS
+        
+        xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
+        bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
+        
+        # Bán kính xe an toàn để tính va chạm vật lý với bóng
+        safe_car_radius = math.hypot(CAR_L/2 + 1.0, CAR_WIDTH/2)
+        
+        # Gọi hàm di chuyển bóng với đầy đủ check va chạm
+        for obs in dyn_obstacles:
+            # Nếu xe chưa click xong điểm bắt đầu thì không truyền current_state vào check va chạm
+            active_robot_state = current_state if click_step >= 1 else None
+            obs.move(dt_frame, bounds, outer_poly, real_holes, active_robot_state, safe_car_radius)
+            
         for event in pygame.event.get():
             if event.type == pygame.QUIT: running = False
             elif event.type == pygame.KEYDOWN:
@@ -636,28 +726,19 @@ def main():
                 elif event.key == pygame.K_r: reset_sim(False)
                 elif event.key == pygame.K_TAB: algo_mode = "MCPP" if algo_mode == "RRT" else "RRT"; reset_sim(False)
             
-            # --- XỬ LÝ SỰ KIỆN CLICK CHUỘT ---
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if click_step < 2:
                     wx, wy = from_scr(event.pos[0], event.pos[1])
                     if click_step == 0:
-                        # Click lần 1: Chọn Điểm Đầu, mặc định hướng là 0 Radian
-                        current_state = (wx, wy, 0.0) 
-                        click_step = 1
+                        current_state = (wx, wy, 0.0); click_step = 1
                     elif click_step == 1:
-                        # Click lần 2: Chọn Điểm Đích, mặc định hướng là 0 Radian
-                        goal_pos = np.array([wx, wy])
-                        goal_yaw = 0.0 
-                        click_step = 2
-                        is_planning = True
+                        goal_pos = np.array([wx, wy]); goal_yaw = 0.0 
+                        click_step = 2; is_planning = True
                         
-                        # Chỉ Khởi tạo Planner khi đã có đủ Start và Goal
-                        xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
-                        bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
                         if algo_mode == "RRT":
-                            planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
+                            planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, bounds, dyn_obstacles)
                         else:
-                            planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom)
+                            planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, global_grid_penalties, dyn_obstacles)
 
         if is_planning and click_step == 2:
             for _ in range(20): 
@@ -683,37 +764,26 @@ def main():
             
             for i in range(path_index, look_limit):
                 fs = flat_planned_path[i]
-                collided, hit_idx = check_collision_with_index(fs[0], fs[1], fs[2], outer_poly, real_holes)
+                collided, hit_idx = check_collision_with_index(fs[0], fs[1], fs[2], outer_poly, real_holes, dyn_obstacles)
                 if collided:
                     collision_detected = True
-                    if hit_idx != -1 and hit_idx not in known_hole_indices:
+                    if hit_idx >= 0 and hit_idx not in known_hole_indices:
                         known_hole_indices.add(hit_idx)
                         planner_holes_geom.append(real_holes[hit_idx])
+                        hit_obstacle = real_holes[hit_idx]
+                        for pt in hit_obstacle:
+                            gid = (int(pt[0] // BIG_GRID_SIZE), int(pt[1] // BIG_GRID_SIZE))
+                            global_grid_penalties[gid] = global_grid_penalties.get(gid, 0) + 5000.0 
                     break
             
             if collision_detected:
                 is_planning = True 
-                planned_path = []
-                flat_planned_path = []
+                planned_path = []; flat_planned_path = []
                 
-                # --- LOGIC PHONG TỎA Ô (PROACTIVE GRID BANNING) ---
-                # Khi phát hiện vật cản mới, phạt NẶNG tất cả các Grid Shell chứa vật cản này
-                hit_obstacle = real_holes[hit_idx]
-                for pt in hit_obstacle:
-                    gid = (int(pt[0] // BIG_GRID_SIZE), int(pt[1] // BIG_GRID_SIZE))
-                    # Bơm 5000 điểm phạt vào ô này, MCPP sẽ kinh hãi không dám đi vào
-                    global_grid_penalties[gid] = global_grid_penalties.get(gid, 0) + 5000.0 
-                
-                xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
-                bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
-                
-                # CHUYỀN TRÍ NHỚ TOÀN CỤC VÀO PLANNER MỚI
                 if algo_mode == "RRT":
-                    planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
+                    planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, bounds, dyn_obstacles)
                 else:
-                    planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, global_grid_penalties)
-                
-                print(f"Obstacle ahead! Banned grids around obstacle. Re-routing...")
+                    planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, global_grid_penalties, dyn_obstacles)
             else:
                 if path_index < len(flat_planned_path):
                     current_state = flat_planned_path[path_index]
@@ -728,6 +798,10 @@ def main():
         for i, h in enumerate(real_holes):
             col = RED if i in known_hole_indices else GHOST_GRAY
             pygame.draw.polygon(screen, col, [to_scr(p) for p in h])
+
+        # Vẽ vật cản động
+        for obs in dyn_obstacles:
+            pygame.draw.circle(screen, DYN_COLOR, to_scr((obs.x, obs.y)), int(obs.radius * scale))
 
         if is_planning and click_step == 2:
             for node in planner.node_list:
@@ -749,38 +823,27 @@ def main():
         if len(path_history) > 1:
             pygame.draw.lines(screen, BLACK, False, [to_scr(p) for p in path_history], 1)
 
-        # Vẽ điểm Đích nếu đã click
         if click_step >= 2:
             g_scr = to_scr(goal_pos)
             pygame.draw.circle(screen, BLUE, g_scr, int(GOAL_RADIUS * scale))
             arrow_end = (goal_pos[0] + 4.0*math.cos(goal_yaw), goal_pos[1] + 4.0*math.sin(goal_yaw))
             pygame.draw.line(screen, BLUE, g_scr, to_scr(arrow_end), 3)
 
-        # Vẽ xe nếu đã click chọn điểm đầu
         if click_step >= 1:
             draw_car(current_state)
 
-        # Giao diện chữ trên màn hình
         screen.blit(font.render(f"Mode: {algo_mode} | [TAB] Switch | [N] Next Map | [R] Reset Map", True, BLUE), (10, 10))
         
-        # Logic cập nhật trạng thái UI
-        if click_step == 0:
-            status = "VUI LONG CLICK CHON DIEM DAU"
-            color_st = BLUE
-        elif click_step == 1:
-            status = "VUI LONG CLICK CHON DIEM DICH"
-            color_st = BLUE
+        if click_step == 0: status = "VUI LONG CLICK CHON DIEM DAU"; color_st = BLUE
+        elif click_step == 1: status = "VUI LONG CLICK CHON DIEM DICH"; color_st = BLUE
         else:
             reached_end_of_path = (flat_planned_path and path_index >= len(flat_planned_path))
             if not is_planning and reached_end_of_path:
-                status = "FINISHED"
-                color_st = GREEN
+                status = "FINISHED"; color_st = GREEN
             elif is_planning:
-                status = "PLANNING..."
-                color_st = RED
+                status = "PLANNING..."; color_st = RED
             else:
-                status = "MOVING"
-                color_st = GREEN
+                status = "MOVING"; color_st = GREEN
 
         screen.blit(font.render(f"Status: {status}", True, color_st), (10, 30))
         screen.blit(font.render("GREEN: Fwd | ORANGE: Rev | PURPLE: Dubins", True, BLACK), (10, 50))

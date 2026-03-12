@@ -35,12 +35,13 @@ def main():
     
     click_step = 0 
     is_planning = False
+    is_crashed = False # TRẠNG THÁI MỚI: Kiểm tra xe có bị đâm không
     scale = 1.0
 
     def reset_sim(new_map=False):
         nonlocal outer_poly, real_holes, current_state, goal_pos, goal_yaw, known_hole_indices, planner_holes_geom
         nonlocal planner, planned_path, flat_planned_path, path_index, is_planning, scale, path_history, click_step
-        nonlocal global_grid_penalties, dyn_obstacles
+        nonlocal global_grid_penalties, dyn_obstacles, is_crashed
 
         use_dummy = False
         if map_folders:
@@ -58,7 +59,7 @@ def main():
         mx = max(max(xs), max(ys))
         scale = (WINDOW_SIZE - 80) / mx
         
-        click_step = 0; is_planning = False; planner = None
+        click_step = 0; is_planning = False; planner = None; is_crashed = False
         current_state = (0.0, 0.0, 0.0)
         goal_pos = np.array([0.0, 0.0]); goal_yaw = 0.0
         
@@ -101,10 +102,16 @@ def main():
         # --- XÁC ĐỊNH TRẠNG THÁI VỀ ĐÍCH ---
         is_finished = (click_step == 2 and not is_planning and flat_planned_path and path_index >= len(flat_planned_path))
 
+        # --- XÁC ĐỊNH TAI NẠN THỰC TẾ (CRASH) ---
+        if click_step >= 1 and not is_finished and not is_crashed:
+            # t_lookahead = 0.0 nghĩa là kiểm tra đụng chạm vật lý ngay tại thời khắc hiện tại
+            hit_now, _ = check_collision_with_index(current_state[0], current_state[1], current_state[2], outer_poly, real_holes, dyn_obstacles, t_lookahead=0.0)
+            if hit_now:
+                is_crashed = True
+                print("💥 CRASH DETECTED! Shutting down planner.")
+
         # 1. Các quả bóng luôn di chuyển vật lý trong thế giới
         for obs in dyn_obstacles:
-            # Nếu xe đã về đích (is_finished), tắt va chạm vật lý thân xe để không bị bóng quấy rầy
-            # Bóng vẫn sẽ nảy vì đụng phải Vùng Đích Đến (active_goal_pos)
             active_robot_state = current_state if (click_step >= 1 and not is_finished) else None
             active_goal_pos = goal_pos if click_step >= 2 else None
             obs.move(dt_frame, bounds, outer_poly, real_holes, active_robot_state, safe_car_radius, active_goal_pos, GOAL_RADIUS)
@@ -113,17 +120,17 @@ def main():
         # 2. BỘ LỌC CẢM BIẾN (Chỉ nhận diện vật trong Radar)
         # ========================================================
         visible_dyn_obs = []
-        if click_step >= 1 and not is_finished: # Đã về đích thì tắt Radar
+        if click_step >= 1 and not is_finished and not is_crashed:
             rx, ry = current_state[0], current_state[1]
             for obs in dyn_obstacles:
                 if math.hypot(obs.x - rx, obs.y - ry) <= (SENSOR_RADIUS + obs.radius):
                     visible_dyn_obs.append(obs)
 
         # ========================================================
-        # 3. LÙI KHẨN CẤP (Dùng visible_dyn_obs)
+        # 3. LÙI KHẨN CẤP (Bỏ qua nếu đã đâm hoặc đã về đích)
         # ========================================================
         emergency_override = False
-        if click_step >= 1 and not is_finished: # Khóa Lùi khẩn cấp nếu đã về đích
+        if click_step >= 1 and not is_finished and not is_crashed: 
             hit, h_idx = check_collision_with_index(current_state[0], current_state[1], current_state[2], outer_poly, real_holes, visible_dyn_obs, t_lookahead=0.8)
             if hit and h_idx == -3:
                 emergency_override = True
@@ -156,7 +163,7 @@ def main():
                 elif event.key == pygame.K_r: reset_sim(False)
                 elif event.key == pygame.K_TAB: algo_mode = "MCPP" if algo_mode == "RRT" else "RRT"; reset_sim(False)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if click_step < 2:
+                if click_step < 2 and not is_crashed:
                     wx, wy = from_scr(event.pos[0], event.pos[1])
                     if click_step == 0:
                         current_state = (wx, wy, 0.0); click_step = 1
@@ -169,9 +176,9 @@ def main():
                             planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, planner_holes_geom, global_grid_penalties, None)
 
         # ========================================================
-        # 4. TÌM ĐƯỜNG & ĐẠP PHANH (Dùng visible_dyn_obs)
+        # 4. TÌM ĐƯỜNG & ĐẠP PHANH (Khóa nếu đã đâm hoặc đang lùi)
         # ========================================================
-        if not emergency_override:
+        if not emergency_override and not is_crashed:
             if is_planning and click_step == 2:
                 for _ in range(20): 
                     path_segments = planner.plan_step()
@@ -230,7 +237,8 @@ def main():
         # --- LOGIC CHỮ HIỂN THỊ UI ---
         ui_status = ""
         ui_color = BLUE
-        if emergency_override: ui_status = "DANGER! REVERSING!"; ui_color = RED
+        if is_crashed: ui_status = "CRASHED! PRESS 'R' TO RESTART"; ui_color = BLACK
+        elif emergency_override: ui_status = "DANGER! REVERSING!"; ui_color = RED
         elif click_step == 0: ui_status = "CLICK CHON DIEM DAU"
         elif click_step == 1: ui_status = "CLICK CHON DIEM DICH"
         else:
@@ -238,7 +246,7 @@ def main():
                 if 'dynamic_obstacle_incoming' in locals() and dynamic_obstacle_incoming:
                     ui_status = "BRAKING..."; ui_color = (255, 140, 0)
                 else: ui_status = "MOVING"; ui_color = GREEN
-            elif not is_planning and path_index >= len(flat_planned_path): ui_status = "FINISHED"; ui_color = GREEN
+            elif is_finished: ui_status = "FINISHED"; ui_color = GREEN
             elif is_planning: ui_status = "PLANNING..."; ui_color = RED
 
         # ========================================================
@@ -251,7 +259,7 @@ def main():
             col = RED if i in known_hole_indices else GHOST_GRAY
             pygame.draw.polygon(screen, col, [to_scr(p) for p in h])
 
-        if click_step >= 1:
+        if click_step >= 1 and not is_finished and not is_crashed:
             pygame.draw.circle(screen, (200, 230, 255), to_scr(current_state[:2]), int(SENSOR_RADIUS * scale), 1)
 
         for obs in dyn_obstacles:
@@ -262,7 +270,7 @@ def main():
             else:
                 pygame.draw.circle(screen, (220, 220, 220), to_scr((obs.x, obs.y)), int(obs.radius * scale))
 
-        if is_planning and click_step == 2:
+        if is_planning and click_step == 2 and not is_crashed:
             for node in planner.node_list:
                 parent = getattr(node, 'parent', None) or getattr(node, 'parent_node', None)
                 if parent:
@@ -288,7 +296,10 @@ def main():
             arrow_end = (goal_pos[0] + 4.0*math.cos(goal_yaw), goal_pos[1] + 4.0*math.sin(goal_yaw))
             pygame.draw.line(screen, BLUE, g_scr, to_scr(arrow_end), 3)
 
-        if click_step >= 1: draw_car(current_state)
+        # Đổi màu xe thành Đen nếu bị đâm
+        if click_step >= 1: 
+            car_draw_color = BLACK if is_crashed else CAR_COLOR
+            draw_car(current_state, car_draw_color)
 
         screen.blit(font.render(f"Mode: {algo_mode} | [TAB] Switch | [N] Next | [R] Reset", True, BLUE), (10, 10))
         screen.blit(font.render(f"Status: {ui_status}", True, ui_color), (10, 30))

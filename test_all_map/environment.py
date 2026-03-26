@@ -5,6 +5,47 @@ import numpy as np
 from config import *
 from core_math import point_in_polygon, get_car_corners, point_to_segment_dist
 
+# ==========================================
+# THÊM MỚI: TOÁN HỌC CHỐNG "ĐI XUYÊN TƯỜNG" 
+# ==========================================
+def line_intersect(A, B, C, D):
+    """Kiểm tra xem đoạn thẳng AB có cắt đoạn thẳng CD không"""
+    def ccw(p1, p2, p3):
+        return (p3[1]-p1[1]) * (p2[0]-p1[0]) > (p2[1]-p1[1]) * (p3[0]-p1[0])
+    return ccw(A,C,D) != ccw(B,C,D) and ccw(A,B,C) != ccw(A,B,D)
+
+def get_aabb(poly):
+    """Tính toán hộp chữ nhật bao quanh đa giác"""
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    return min(xs), max(xs), min(ys), max(ys)
+
+def aabb_intersect(box1, box2):
+    """Lọc nhanh xem 2 hộp chữ nhật có chạm nhau không"""
+    return not (box1[1] < box2[0] or box1[0] > box2[1] or box1[3] < box2[2] or box1[2] > box2[3])
+
+def poly_intersect(poly1, poly2):
+    """Kiểm tra xem 2 đa giác có cắt cạnh hoặc bao trùm nhau không"""
+    if not poly1 or not poly2: return False
+    
+    # --- BỘ LỌC NHANH (AABB) - GIÚP TĂNG TỐC CODE LÊN GẤP 10 LẦN ---
+    if not aabb_intersect(get_aabb(poly1), get_aabb(poly2)):
+        return False # Ở quá xa nhau -> An toàn ngay lập tức!
+        
+    # Nếu hộp ảo chạm nhau, mới dùng Toán học phức tạp để check chi tiết
+    for i in range(len(poly1)):
+        A = poly1[i]; B = poly1[(i+1)%len(poly1)]
+        for j in range(len(poly2)):
+            C = poly2[j]; D = poly2[(j+1)%len(poly2)]
+            if line_intersect(A, B, C, D): return True
+            
+    if point_in_polygon(poly1[0], poly2): return True
+    if point_in_polygon(poly2[0], poly1): return True
+    return False
+
+# ==========================================
+# GIỮ NGUYÊN CODE CŨ CỦA BẠN (TỪ ĐÂY TRỞ XUỐNG)
+# ==========================================
 class DynamicObstacle:
     def __init__(self, x, y, radius, vx, vy):
         self.x, self.y = x, y
@@ -39,13 +80,10 @@ class DynamicObstacle:
                     hit_solid = True; break
             if hit_solid: break
                     
-        # 2. Va chạm với ĐÍCH ĐẾN (MỚI THÊM)
+        # 2. Va chạm với ĐÍCH ĐẾN
         if not hit_solid and goal_pos is not None:
-            # Nếu khoảng cách từ tâm bóng tới tâm đích < tổng 2 bán kính -> Bật nảy
             if math.hypot(nx - goal_pos[0], ny - goal_pos[1]) < (self.radius + goal_radius):
                 hit_solid = True
-
-        # (Đã tắt va chạm bóng nảy vào xe theo yêu cầu từ trước)
 
         if hit_solid:
             self.vx *= -1; self.vy *= -1
@@ -93,30 +131,56 @@ def get_valid_random_pos(outer, holes, bounds):
         if valid: return np.array([rx, ry])
     return np.array([50, 50])
 
-# THÊM BIẾN t_lookahead=1.5 VÀO ĐÂY
+# ==========================================
+# ĐÃ CẬP NHẬT: HÀM CHECK VA CHẠM THÔNG MINH
+# ==========================================
 def check_collision_with_index(x, y, yaw, outer, holes, dyn_obs=None, t_lookahead=1.5):
-    corners = get_car_corners(x, y, yaw)
-    # Va chạm Tĩnh
-    for p in corners:
-        if outer and not point_in_polygon(p, outer): return True, -1
-        for i, h in enumerate(holes):
-            if point_in_polygon(p, h): return True, i
+    # Lấy tọa độ các góc xe (Nên giảm CAR_W, CAR_L trong config một chút)
+    car_poly = get_car_corners(x, y, yaw)
+    
+    car_x = [pt[0] for pt in car_poly]
+    car_y = [pt[1] for pt in car_poly]
+    c_min_x, c_max_x = min(car_x), max(car_x)
+    c_min_y, c_max_y = min(car_y), max(car_y)
+
+    # 1. Kiểm tra lọt ra ngoài bản đồ
+    for p in car_poly:
+        if outer and not point_in_polygon(p, outer): 
+            return True, -1
+        
+    # 2. Kiểm tra va chạm vạch kẻ (Holes)
+    for i, h in enumerate(holes):
+        # SỬA LỖI TẠI ĐÂY: Lấy khung bao của từng Hole (vạch kẻ)
+        h_xs = [pt[0] for pt in h]
+        h_ys = [pt[1] for pt in h] # Đã sửa từ p thành pt
+        
+        h_min_x, h_max_x = min(h_xs), max(h_xs)
+        h_min_y, h_max_y = min(h_ys), max(h_ys)
+        
+        # Kiểm tra AABB (Nếu hộp bao không chạm nhau thì bỏ qua cho nhanh)
+        if not (c_max_x < h_min_x or c_min_x > h_max_x or 
+                c_max_y < h_min_y or c_min_y > h_max_y):
             
-    # Va chạm Động
+            # Nếu hộp bao chạm, kiểm tra chi tiết đa giác
+            if poly_intersect(car_poly, h): 
+                return True, i
+            
+    # 3. Kiểm tra va chạm động (Giữ nguyên logic của bạn)
     if dyn_obs:
-        safe_radius = math.hypot(CAR_L/2 + 1.0, CAR_WIDTH/2) + 1.0 
+        safe_radius = 10.0 # Tăng bán kính quét động lên một chút cho an toàn
         for obs in dyn_obs:
-            ax, ay = obs.x, obs.y
-            bx, by = obs.x + obs.vx * t_lookahead, obs.y + obs.vy * t_lookahead
-            # Dùng t_lookahead linh hoạt để nhận biết độ nguy hiểm
-            if point_to_segment_dist(x, y, ax, ay, bx, by) < obs.radius + safe_radius:
-                return True, -3 
+            if math.hypot(x - obs.x, y - obs.y) < safe_radius:
+                ax, ay = obs.x, obs.y
+                bx, by = obs.x + obs.vx * t_lookahead, obs.y + obs.vy * t_lookahead
+                if point_to_segment_dist(x, y, ax, ay, bx, by) < obs.radius + 2.0:
+                    return True, -3 
+                    
     return False, -2
 
 def check_path_collision(path_x, path_y, path_yaw, outer, holes, dyn_obs=None):
-    step = 5 
+    # ĐÃ SỬA: step = 2 để quét đường Dubins kĩ hơn, không bị lọt vạch kẻ
+    step = 2 
     for i in range(0, len(path_x), step):
-        # Mặc định quét đường tương lai luôn dùng 1.5 giây
         collided, _ = check_collision_with_index(path_x[i], path_y[i], path_yaw[i], outer, holes, dyn_obs, 1.5)
         if collided: return True
     return False

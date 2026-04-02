@@ -6,14 +6,14 @@ import math
 import random
 
 from config import *
-from core_math import get_car_corners, point_in_polygon
-from planners import KinematicRRT, KinematicMCPP
+from core_math import get_car_corners, point_in_polygon, point_to_segment_dist
+from planners import KinematicRRT, KinematicMCPP, get_topological_path
 from environment import check_collision_with_index
 
 MATH_WIDTH_TARGET = 100.0 # ÉP CHIỀU DÀI BẢN ĐỒ VỀ ĐÚNG 100 ĐƠN VỊ
 
 # ==========================================
-# 1. HÀM ĐỌC ẢNH VÀ TRÍCH XUẤT ĐA GIÁC 
+# 1. HÀM ĐỌC ẢNH VÀ TRÍCH XUẤT ĐA GIÁC (BẢO TOÀN VẠCH KẺ MẢNH)
 # ==========================================
 def load_and_scale_image(image_path, max_width=1000):
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -26,30 +26,43 @@ def load_and_scale_image(image_path, max_width=1000):
         img = cv2.resize(img, (max_width, int(img.shape[0] * scale_img)))
         
     h_px, w_px = img.shape
-    
-    # TỰ ĐỘNG TÍNH SCALE: Sao cho w_px * math_scale = 100.0
     math_scale = MATH_WIDTH_TARGET / float(w_px)
     
     _, thresh = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
     
-    # THÊM: Làm mượt vạch kẻ để tránh răng cưa gây va chạm ảo
-    kernel = np.ones((3,3), np.uint8)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    # [SỬA LỖI 1]: LÀM DÀY VẠCH KẺ MẢNH
+    # Dùng hàm Dilate để "bơm" các vạch đỗ xe mỏng manh lên, tránh bị đứt gãy
+    kernel_dilate = np.ones((2,2), np.uint8)
+    thresh = cv2.dilate(thresh, kernel_dilate, iterations=1)
     
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # [SỬA LỖI 2]: TRÁM KHỐI RỖ (CARO)
+    # Vẫn giữ hàm Close để nối liền các khối đen ở góc bản đồ
+    kernel_close = np.ones((7,7), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_close)
+    
+    # XÓA BỎ LỆNH MORPH_OPEN Ở BẢN CŨ ĐỂ KHÔNG LÀM BỐC HƠI VẠCH KẺ
+    
+    # Đóng gói viền để nhận diện khối đen tràn ảnh
+    cv2.rectangle(thresh, (0, 0), (w_px - 1, h_px - 1), 0, 2)
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     
     real_holes_math = []
     for cnt in contours:
-        # TĂNG NGƯỠNG: Chỉ lấy những vạch kẻ thực sự (diện tích > 100 pixel)
-        if cv2.contourArea(cnt) > 100: 
-            # Làm mịn đa giác để giảm số cạnh (giúp check va chạm nhanh hơn)
-            epsilon = 0.01 * cv2.arcLength(cnt, True) 
+        area = cv2.contourArea(cnt)
+        length = cv2.arcLength(cnt, True)
+        
+        # [SỬA LỖI 3]: CỨU VẠCH KẺ DỰA VÀO CHIỀU DÀI
+        # Nếu diện tích nhỏ nhưng chiều dài > 50 pixel thì chắc chắn nó là vạch đỗ xe!
+        if area > 30 or length > 50: 
+            # Giảm độ làm tròn từ 0.01 xuống 0.005 để các vạch kẻ giữ được độ thẳng góc
+            epsilon = 0.005 * length 
             approx = cv2.approxPolyDP(cnt, epsilon, True)
             
             poly_m = []
             for pt in approx:
                 mx = float(pt[0][0]) * math_scale
-                my = float(h_px - pt[0][1]) * math_scale # Giữ nguyên logic lật Y của bạn
+                my = float(h_px - pt[0][1]) * math_scale 
                 poly_m.append((mx, my))
             
             if len(poly_m) >= 3:
@@ -71,7 +84,7 @@ def load_and_scale_image(image_path, max_width=1000):
 # 2. CẢM BIẾN TÌM HƯỚNG CỬA CHUỒNG 
 # ==========================================
 def cast_ray(x, y, yaw, outer_poly, holes, max_dist=20.0):
-    step = 0.1 # Bước dò 0.1 đơn vị (Tránh đi xuyên tường)
+    step = 0.1 # Bước dò 0.1 đơn vị
     dist = 0.0
     while dist < max_dist:
         nx = x + math.cos(yaw) * dist
@@ -95,7 +108,7 @@ def get_best_yaw_for_parking(wx, wy, outer_poly, holes):
 def main():
     pygame.init()
     
-    IMAGE_FILE = "parking_lot_1.jpg"
+    IMAGE_FILE = "parking_lot_2.jpg"
     print(f"Đang thiết lập sa bàn quy chuẩn 100 từ ảnh '{IMAGE_FILE}' ...")
     
     outer_poly, real_holes, w_px, h_px, bg_surface, math_scale = load_and_scale_image(IMAGE_FILE)
@@ -166,11 +179,80 @@ def main():
                         
                         click_step = 2; is_planning = True
                         print(f"🚀 Bắt đầu tìm đường bằng {algo_mode}...")
+                        
                         if algo_mode == "RRT":
                             planner = KinematicRRT(current_state, goal_pos, goal_yaw, outer_poly, real_holes, bounds, None)
                         else:
-                            # ĐỒNG BỘ: Đã thay thế {} bằng bounds để MCPP nhận đúng kích thước map
-                            planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, real_holes, bounds, None)
+                            # TẦNG 1: Dùng hàm A* để lấy danh sách waypoints
+                            def get_clearance(pt):
+                                if outer_poly and not point_in_polygon(pt, outer_poly): 
+                                    return 0.0
+                                for h in real_holes:
+                                    if point_in_polygon(pt, h): 
+                                        return 0.0
+                                
+                                min_dist = 999.0
+                                for h in real_holes:
+                                    for i in range(len(h)):
+                                        A = h[i]; B = h[(i+1)%len(h)]
+                                        d = point_to_segment_dist(pt[0], pt[1], A[0], A[1], B[0], B[1])
+                                        if d < min_dist:
+                                            min_dist = d
+                                return min_dist
+                            
+                            # ====================================================
+                            # 1. ĐIỂM THOÁT CHUỒNG (Rút ngắn còn 8.0 cho an toàn)
+                            # ====================================================
+                            escape_dist = 8.0 
+                            escape_x = current_state[0] + math.cos(current_state[2]) * escape_dist
+                            escape_y = current_state[1] + math.sin(current_state[2]) * escape_dist
+                            escape_pt = (escape_x, escape_y)
+
+                            # ====================================================
+                            # 2. XÁC ĐỊNH HƯỚNG HÀNH LANG TỐI ƯU
+                            # ====================================================
+                            out_x, out_y = math.cos(goal_yaw), math.sin(goal_yaw)
+                            perp_x1, perp_y1 = -out_y, out_x
+                            perp_x2, perp_y2 = out_y, -out_x
+
+                            # Chọn hướng dọc hành lang hướng về phía xe đang đứng
+                            dx = escape_pt[0] - goal_pos[0]
+                            dy = escape_pt[1] - goal_pos[1]
+                            if (dx * perp_x1 + dy * perp_y1) > 0:
+                                perp_x, perp_y = perp_x1, perp_y1
+                            else:
+                                perp_x, perp_y = perp_x2, perp_y2
+
+                            # ====================================================
+                            # 3. QUỸ ĐẠO LÙI (Kéo các điểm nằm trọn giữa hành lang)
+                            # ====================================================
+                            # Điểm mặt chuồng (Cách cửa 8.0)
+                            front_x = goal_pos[0] + out_x * 8.0
+                            front_y = goal_pos[1] + out_y * 8.0
+                            front_pt = (front_x, front_y)
+
+                            # Điểm vòng lên (Từ mặt chuồng tiến dọc hành lang 12.0)
+                            pull_x = front_x + perp_x * 12.0
+                            pull_y = front_y + perp_y * 12.0
+                            pull_ahead_pt = (pull_x, pull_y)
+
+                            # Điểm bo cua lùi
+                            curve_x = front_x + perp_x * 6.0 + out_x * 2.0
+                            curve_y = front_y + perp_y * 6.0 + out_y * 2.0
+                            curve_pt = (curve_x, curve_y)
+
+                            # 4. CHẠY A* TỚI ĐIỂM VÒNG LÊN 
+                            waypoints = get_topological_path(escape_pt, pull_ahead_pt, bounds, get_clearance, grid_res=2.0)
+                            
+                            # 5. LẮP RÁP LỘ TRÌNH
+                            waypoints.insert(0, escape_pt)
+                            waypoints.append(curve_pt)     
+                            waypoints.append(front_pt)     
+                            waypoints.append(goal_pos)
+                            print(f"🗺️ Tầng 1: Đã tìm thấy xương sống dẫn đường gồm {len(waypoints)} điểm.")
+                            
+                            # TẦNG 2: MCPP có dẫn hướng (Truyền waypoints vào)
+                            planner = KinematicMCPP(current_state, goal_pos, goal_yaw, outer_poly, real_holes, bounds, waypoints, None)
 
         if click_step >= 1 and not is_finished and not is_crashed:
             hit_now, _ = check_collision_with_index(current_state[0], current_state[1], current_state[2], outer_poly, real_holes, None, t_lookahead=0.0)
@@ -199,6 +281,29 @@ def main():
         screen.blit(bg_surface, (0, 0)) 
         if outer_poly: pygame.draw.polygon(screen, (50,50,50), [to_pygame(p[0], p[1]) for p in outer_poly], 1)
 
+        # ==========================================================
+        # VẼ CÁC WAYPOINT TỪ TẦNG 1 (Xương sống dẫn đường)
+        # ==========================================================
+        if click_step >= 2 and algo_mode == "MCPP" and planner and hasattr(planner, 'waypoints'):
+            wp_scr = [to_pygame(wp[0], wp[1]) for wp in planner.waypoints]
+            if len(wp_scr) > 1:
+                # Vẽ đường thẳng nối các Waypoint (Màu Cam)
+                pygame.draw.lines(screen, (255, 165, 0), False, wp_scr, 2)
+                
+                # Vẽ từng điểm Waypoint
+                for i, pt in enumerate(wp_scr):
+                    # Lấy index của waypoint hiện tại mà xe đang nhắm tới
+                    current_idx = getattr(planner, 'current_wp_idx', -1)
+                    
+                    if i == current_idx:
+                        # Điểm Mồi Mục Tiêu Hiện Tại: Vẽ To và có viền Đỏ để dễ nhìn
+                        pygame.draw.circle(screen, (255, 0, 0), pt, 7)
+                        pygame.draw.circle(screen, (255, 255, 255), pt, 3)
+                    else:
+                        # Các Điểm Mồi Bình Thường: Vẽ nhỏ hơn, màu Cam
+                        pygame.draw.circle(screen, (255, 140, 0), pt, 4)
+        # ==========================================================
+
         if is_planning and click_step == 2 and not is_crashed:
             for node in planner.node_list:
                 parent = getattr(node, 'parent', None) or getattr(node, 'parent_node', None)
@@ -220,7 +325,7 @@ def main():
             pygame.draw.circle(screen, BLUE, g_scr, int(GOAL_RADIUS / math_scale))
             arrow_end = (goal_pos[0] + 4.0*math.cos(goal_yaw), goal_pos[1] + 4.0*math.sin(goal_yaw))
             pygame.draw.line(screen, BLUE, g_scr, to_pygame(arrow_end[0], arrow_end[1]), 3)
-
+            
         if click_step >= 1: 
             car_draw_color = BLACK if is_crashed else CAR_COLOR
             draw_car(current_state, car_draw_color)

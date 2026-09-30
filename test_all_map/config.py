@@ -30,7 +30,7 @@ SIM_TIME = 0.5
 
 # --- THÔNG SỐ CẢM BIẾN & RADAR ---
 LOOKAHEAD_STEPS = 5   
-SENSOR_RADIUS = 25.0  # Bán kính tầm nhìn của Radar
+SENSOR_RADIUS = 15.0  # Bán kính tầm nhìn của Radar
 
 # --- THÔNG SỐ CHƯỚNG NGẠI VẬT ĐỘNG ---
 NUM_DYN_OBS = 6       

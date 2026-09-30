@@ -140,11 +140,11 @@ def main():
             known_hole_indices = set(); planner_holes_geom = []
             dyn_obstacles.clear()
             bounds = [0, mx, 0, mx]
-            for _ in range(NUM_DYN_OBS):
-                rp = get_valid_random_pos(outer_poly, real_holes, bounds)
-                angle = random.uniform(0, 2*math.pi)
-                speed = random.uniform(DYN_OBS_SPEED/2, DYN_OBS_SPEED)
-                dyn_obstacles.append(DynamicObstacle(rp[0], rp[1], DYN_OBS_RADIUS, math.cos(angle)*speed, math.sin(angle)*speed))
+            # for _ in range(NUM_DYN_OBS):
+            #     rp = get_valid_random_pos(outer_poly, real_holes, bounds)
+            #     angle = random.uniform(0, 2*math.pi)
+            #     speed = random.uniform(DYN_OBS_SPEED/2, DYN_OBS_SPEED)
+            #     dyn_obstacles.append(DynamicObstacle(rp[0], rp[1], DYN_OBS_RADIUS, math.cos(angle)*speed, math.sin(angle)*speed))
             
         planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
 
@@ -219,11 +219,66 @@ def main():
             obs.move(dt_frame, bounds, outer_poly, real_holes, active_robot_state, safe_car_radius, active_goal_pos, GOAL_RADIUS)
             
         visible_dyn_obs = []
+        new_static_detected = False # Cờ báo hiệu có vật cản tĩnh mới lọt vào tầm nhìn
+        
         if click_step >= 1 and not is_stage_finished and not is_crashed:
             rx, ry = current_state[0], current_state[1]
+            
+            # 1. Quét chướng ngại vật động
             for obs in dyn_obstacles:
                 if math.hypot(obs.x - rx, obs.y - ry) <= (SENSOR_RADIUS + obs.radius):
                     visible_dyn_obs.append(obs)
+                    
+            # 2. THUẬT TOÁN RADA VẬT LÝ: Quét chướng ngại vật tĩnh trong vòng tròn SENSOR_RADIUS
+            for i, h in enumerate(real_holes):
+                if i not in known_hole_indices:
+                    # Kiểm tra khoảng cách từ tâm robot đến các cạnh của đa giác (vật cản)
+                    for j in range(len(h)):
+                        A = h[j]
+                        B = h[(j+1)%len(h)]
+                        d = point_to_segment_dist(rx, ry, A[0], A[1], B[0], B[1])
+                        
+                        # Nếu tầm nhìn (SENSOR_RADIUS) chạm vào bất kỳ cạnh nào của vật cản
+                        if d <= SENSOR_RADIUS:
+                            known_hole_indices.add(i)
+                            planner_holes_geom.append(h)
+                            new_static_detected = True
+                            print(f"📡 Rada quét thấy vật cản mới! Bắt đầu tính toán lại...")
+                            break # Chỉ cần thấy 1 góc/cạnh là đủ để hiện toàn bộ chướng ngại vật
+                            
+            # Nếu Rada phát hiện vật cản mới -> Dừng lộ trình cũ và quy hoạch lại đường ngay lập tức
+            if new_static_detected:
+                # CHỈ XÉT KHI ĐÃ BẤM ENTER (click_step >= 2) VÀ ĐÃ CÓ ĐÍCH
+                if click_step >= 2 and len(ordered_goals) > 0: 
+                    
+                    # --- KIỂM TRA XEM ĐƯỜNG CŨ CÓ BỊ CHẶN KHÔNG ---
+                    path_is_blocked = False
+                    if flat_planned_path and path_index < len(flat_planned_path):
+                        # Quét trước các điểm còn lại trên đường đi cũ
+                        # (Có thể quét cách đoạn step=3 để giảm tải CPU, ở đây check tất cả)
+                        for i in range(path_index, len(flat_planned_path)):
+                            pt = flat_planned_path[i]
+                            yaw = pt[2] if len(pt) > 2 else current_state[2]
+                            
+                            # Kiểm tra điểm pt này có đâm vào các vật cản ĐÃ BIẾT (planner_holes_geom) hay không
+                            hit, _ = check_collision_with_index(pt[0], pt[1], yaw, outer_poly, planner_holes_geom, None)
+                            if hit:
+                                path_is_blocked = True
+                                break
+                    else:
+                        # Nếu chưa có đường đi hoặc đã đi hết đường, mặc định là cần quy hoạch
+                        path_is_blocked = True 
+
+                    # --- CHỈ QUY HOẠCH LẠI NẾU ĐƯỜNG BỊ CHẶN ---
+                    if path_is_blocked:
+                        print("⚠️ Đường cũ đâm vào vật cản mới! Bắt buộc tính toán lại lộ trình...")
+                        is_planning = True
+                        planned_path.clear()
+                        flat_planned_path.clear()
+                        path_index = 0
+                        planner = plan_next_stage(current_state, ordered_goals[current_stage_idx])
+                    else:
+                        print("✅ Vật cản mới phát hiện không cản đường. Tiếp tục lộ trình cũ!")
 
         emergency_override = False
         if click_step >= 1 and not is_stage_finished and not is_crashed: 

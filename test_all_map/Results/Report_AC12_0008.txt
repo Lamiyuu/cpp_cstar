@@ -1,0 +1,19 @@
+==================================================
+ BÁO CÁO TỔNG HỢP NĂNG LƯỢNG & QUỸ ĐẠO
+==================================================
+
+Thời gian chạy: 48.13 giây
+Số lần phát hiện chướng ngại vật: 1
+Số lần Replan: 1
+
+--- 1. THỐNG KÊ QUÃNG ĐƯỜNG & NĂNG LƯỢNG ---
+- Đi thẳng: 223.74 px | 223.74 EU
+- Bẻ lái: 47.07 px | 70.60 EU
+- Đảo chiều: 34 lần | 1700.00 EU
+=> TỔNG NĂNG LƯỢNG: 1994.34 EU
+
+--- 2. LƯU TRỮ THÔNG SỐ ĐỘ MƯỢT (SMOOTHNESS) ---
+- Tổng góc bẻ lái: 2272.12 độ
+- Góc bẻ lái gắt nhất (Max): 1.96 độ
+- Hàm phạt bình phương góc (Penalty): 1.2468 rad^2
+=> Điểm độ mượt trung bình (F_S): 0.017839 rad/bước

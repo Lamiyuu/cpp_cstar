@@ -1,0 +1,20 @@
+==================================================
+ BÁO CÁO TỔNG HỢP NĂNG LƯỢNG (ĐỘNG HỌC GÓC XOAY)
+==================================================
+
+Thời gian chạy: 814.77 giây
+Số lượng Waypoint (n): 2275
+Số lần phát hiện chướng ngại vật: 4
+Số lần Replan: 4
+
+--- 1. THỐNG KÊ NĂNG LƯỢNG ---
+- Năng lượng di chuyển: 2274.00 EU
+- Năng lượng xoay (động): 32.25 EU
+- Năng lượng dừng/nghỉ: 1137.50 EU
+=> TỔNG NĂNG LƯỢNG: 3443.75 EU
+
+--- 2. LƯU TRỮ THÔNG SỐ ĐỘ MƯỢT (SMOOTHNESS) ---
+- Tổng góc bẻ lái: 2309.86 độ
+- Góc bẻ lái gắt nhất (Max): 1.96 độ
+- Hàm phạt bình phương góc (Penalty): 1.2628 rad^2
+=> Điểm độ mượt trung bình (F_S): 0.017721 rad/bước

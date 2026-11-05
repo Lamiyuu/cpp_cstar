@@ -5,11 +5,14 @@ import glob
 import math
 import numpy as np
 import random
-import cv2  # Bổ sung thư viện OpenCV để đọc ảnh
+import cv2  
 
 from config import *
+
+# TĂNG TẦM NHÌN RADAR TRỰC TIẾP TẠI ĐÂY MÀ KHÔNG CẦN SỬA CONFIG.PY
+SENSOR_RADIUS = 50.0 
+
 from core_math import get_car_corners, dist, point_to_segment_dist, point_in_polygon
-# Đã xóa load_data khỏi thư viện environment
 from environment import get_valid_random_pos, DynamicObstacle, check_collision_with_index
 from planners import KinematicRRT, KinematicMCPP, get_topological_path
 from energy_tracker import EnergyTracker
@@ -27,68 +30,57 @@ ALGO_MODES = [
 # ==========================================
 # XỬ LÝ ĐỌC ẢNH VÀ TRÍCH XUẤT CHƯỚNG NGẠI VẬT
 # ==========================================
-def load_map_from_image(image_path, logical_size=300.0):
-    """
-    Đọc ảnh, phân biệt màu trắng là đường đi (outer_poly), các màu khác là chướng ngại.
-    Tự động thu phóng tọa độ Pixel về Tọa độ Logic (logical_size = 100 mét) 
-    để khớp hoàn toàn với cấu hình xe CAR_L = 4.0 của config.py.
-    """
+# ==========================================
+# XỬ LÝ ĐỌC ẢNH VÀ TRÍCH XUẤT CHƯỚNG NGẠI VẬT (ĐÃ FIX LỖI CẮT ẢNH)
+# ==========================================
+def load_map_from_image(image_path, logical_size=500.0): 
     img = cv2.imread(image_path)
     if img is None:
         print(f"Lỗi: Không tìm thấy file {image_path}")
-        return [], []
+        return [], [], None, 0, 0
         
     orig_h, orig_w = img.shape[:2]
-    
-    # HỆ SỐ QUAN TRỌNG: Đổi từ Pixel sang Tọa độ vật lý (mét)
     pixel_to_logic = logical_size / max(orig_w, orig_h)
+    
+    logic_w = orig_w * pixel_to_logic
+    logic_h = orig_h * pixel_to_logic
 
-    # Chuyển sang ảnh xám
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # 1. OUTER_POLY: Coi toàn bộ viền bức ảnh là giới hạn bản đồ
+    outer_poly = [
+        (0.0, 0.0), 
+        (logic_w, 0.0), 
+        (logic_w, logic_h), 
+        (0.0, logic_h)
+    ]
+
+    # 2. TÌM VẬT CẢN: Lọc tất cả các màu KHÔNG PHẢI MÀU TRẮNG
+    lower_white = np.array([240, 240, 240])
+    upper_white = np.array([255, 255, 255])
+    mask_white = cv2.inRange(img, lower_white, upper_white)
     
-    # Chỉ lấy phần màu trắng tinh (> 240) làm đường đi
-    _, thresh = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY)
+    # Đảo ngược mask: Vùng đen/xám của tòa nhà sẽ biến thành màu trắng để OpenCV tìm kiếm
+    mask_obstacles = cv2.bitwise_not(mask_white)
     
-    # Tìm cấu trúc lồng nhau (Đường bao ngoài và các chướng ngại vật bên trong)
-    contours, hierarchy = cv2.findContours(thresh, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    # Dùng RETR_EXTERNAL để lấy tất cả các cục chướng ngại vật rời rạc
+    contours, hierarchy = cv2.findContours(mask_obstacles, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
-    outer_poly = []
     real_holes = []
-    
-    if hierarchy is not None:
-        max_area = 0
-        main_idx = -1
-        for i, cnt in enumerate(contours):
-            if hierarchy[0][i][3] == -1: # Tìm mảng trắng bọc ngoài cùng lớn nhất
-                area = cv2.contourArea(cnt)
-                if area > max_area:
-                    max_area = area
-                    main_idx = i
-                    
-        if main_idx != -1:
-            cnt = contours[main_idx]
+    for cnt in contours:
+        if cv2.contourArea(cnt) > 10: # Bỏ qua nhiễu ảnh quá bé
             epsilon = 0.002 * cv2.arcLength(cnt, True)
             approx = cv2.approxPolyDP(cnt, epsilon, True)
-            # Áp dụng hệ số pixel_to_logic để thu nhỏ tọa độ về đơn vị mét
-            outer_poly = [(float(pt[0][0]) * pixel_to_logic, float(pt[0][1]) * pixel_to_logic) for pt in approx]
             
-            for i, cnt in enumerate(contours):
-                if hierarchy[0][i][3] == main_idx: # Các chướng ngại vật nằm lọt thỏm bên trong
-                    if cv2.contourArea(cnt) > 10: 
-                        epsilon = 0.005 * cv2.arcLength(cnt, True)
-                        approx = cv2.approxPolyDP(cnt, epsilon, True)
-                        hole = [(float(pt[0][0]) * pixel_to_logic, float(pt[0][1]) * pixel_to_logic) for pt in approx]
-                        if len(hole) >= 3:
-                            real_holes.append(hole)
-                            
-    # Nếu không tìm thấy viền trắng, tạo viền mặc định theo tỷ lệ logic
-    if not outer_poly:
-        logic_w = orig_w * pixel_to_logic
-        logic_h = orig_h * pixel_to_logic
-        outer_poly = [(0.0, 0.0), (logic_w, 0.0), (logic_w, logic_h), (0.0, logic_h)]
-        
-    print(f"Đã load map: Chuyển đổi ({orig_w}x{orig_h} pixel) thành map vật lý ({max(orig_w, orig_h)*pixel_to_logic:.1f} mét).")
-    return outer_poly, real_holes
+            # Lật trục Y cho đúng với tọa độ của Pygame
+            hole = [(float(pt[0][0]) * pixel_to_logic, logic_h - float(pt[0][1]) * pixel_to_logic) for pt in approx]
+            if len(hole) >= 3:
+                real_holes.append(hole)
+
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    bg_surface = pygame.surfarray.make_surface(np.transpose(img_rgb, (1, 0, 2)))
+    
+    print(f"Đã nạp map hoàn chỉnh. Kích thước vật lý: {logic_w:.1f}x{logic_h:.1f}m. Số vật cản: {len(real_holes)}")
+    return outer_poly, real_holes, bg_surface, logic_w, logic_h
+
 
 # ==========================================
 # THUẬT TOÁN AMuGOPIA - SẮP XẾP ĐA MỤC TIÊU
@@ -155,6 +147,7 @@ def amugopia_sabo_ordering(start_pos, goals):
         
     return ordered_path
 
+
 # ==========================================
 # CHƯƠNG TRÌNH CHÍNH
 # ==========================================
@@ -162,11 +155,10 @@ def main():
     pygame.init()
     if not os.path.exists("Results"): os.makedirs("Results")
     screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
-    pygame.display.set_caption("Stage-by-Stage Planning: Original vs Paper Algorithms")
+    pygame.display.set_caption("Stage-by-Stage Planning: Paused Dynamic Obstacles")
     clock = pygame.time.Clock()
     font = pygame.font.SysFont("Consolas", 16)
 
-    # ĐỌC TẤT CẢ CÁC FILE ẢNH MAP TRONG THƯ MỤC HIỆN TẠI
     map_images = sorted(glob.glob("*.jpg") + glob.glob("*.png"))
     
     current_map_idx = 0
@@ -181,12 +173,17 @@ def main():
     planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
     dyn_obstacles = [] 
     
-    # Biến cho Stage-by-stage
+    bg_surface = None
+    logic_w = 0.0
+    logic_h = 0.0
+    scaled_bg = None
+    
     multi_goals = [] 
     ordered_goals = []
     current_stage_idx = 0
     
     sim_report = None 
+    need_path_check = False 
     
     click_step = 0 
     is_planning = False
@@ -194,37 +191,85 @@ def main():
     is_finished_all = False
     scale = 1.0
 
+    # HÀM SPAWN SINH VIÊN (Chỉ đứng từ lề đường đi sang)
+    def spawn_new_student(robot_state=None):
+        zone_min_x, zone_max_x = 41.0, 479.0
+        zone_min_y, zone_max_y = 25.0, 51.0
+        STUDENT_RADIUS = 4.0
+        STUDENT_SPEED = 5.0
+        
+        for _ in range(100):
+            if random.choice([True, False]):
+                sy = zone_min_y + 1.0 # Lề dưới
+                angle = random.uniform(math.pi/2 - 0.2, math.pi/2 + 0.2)
+            else:
+                sy = zone_max_y - 1.0 # Lề trên
+                angle = random.uniform(3*math.pi/2 - 0.2, 3*math.pi/2 + 0.2)
+            
+            sx = random.uniform(zone_min_x, zone_max_x)
+            
+            valid = True
+            if outer_poly and not point_in_polygon((sx, sy), outer_poly): valid = False
+            for h in real_holes:
+                if point_in_polygon((sx, sy), h): valid = False
+                
+            # --- THÊM LOGIC SAFE ZONE ---
+            # Nếu sinh viên chuẩn bị xuất hiện quá gần robot (bán kính 60px), tìm điểm khác
+            if valid and robot_state is not None:
+                if math.hypot(sx - robot_state[0], sy - robot_state[1]) < 60.0:
+                    valid = False
+            # ----------------------------
+                    
+            if valid:
+                speed = random.uniform(STUDENT_SPEED * 0.7, STUDENT_SPEED * 1.2)
+                vx = math.cos(angle) * speed
+                vy = math.sin(angle) * speed
+                return DynamicObstacle(sx, sy, STUDENT_RADIUS, vx, vy)
+                
+        return DynamicObstacle(200.0, 35.0, STUDENT_RADIUS, 0, STUDENT_SPEED)
+
     def reset_sim(new_map=False):
         nonlocal outer_poly, real_holes, current_state, known_hole_indices, planner_holes_geom
         nonlocal planner, planned_path, flat_planned_path, path_index, is_planning, scale, path_history, click_step
         nonlocal dyn_obstacles, is_crashed, multi_goals, ordered_goals, current_stage_idx, is_finished_all
-        nonlocal sim_report 
+        nonlocal bg_surface, logic_w, logic_h, sim_report, need_path_check
+        nonlocal scaled_bg, top_left_x, top_left_y, offset_x, offset_y
         
         sim_report = EnergyTracker()
+        need_path_check = False
         
         use_dummy = False
         if map_images:
             image_path = map_images[current_map_idx]
-            if new_map: print(f"Loading Image Map: {image_path}")
-            outer_poly, real_holes = load_map_from_image(image_path)
-            if not outer_poly: 
-                print("Lỗi đọc ảnh, sử dụng map mặc định.")
-                use_dummy = True
-        else: 
-            print("Không tìm thấy file ảnh (.jpg, .png) nào! Vui lòng copy map vào thư mục.")
-            use_dummy = True
+            if new_map: print(f"\nLoading Image Map: {image_path}")
+            outer_poly, real_holes, bg_surface, logic_w, logic_h = load_map_from_image(image_path, logical_size=500.0)
+            if not outer_poly: use_dummy = True
+        else: use_dummy = True
         
         if use_dummy:
             outer_poly = [(0,0), (WINDOW_SIZE,0), (WINDOW_SIZE,WINDOW_SIZE), (0,WINDOW_SIZE)]
             real_holes = [[(300,300), (500,300), (500,500), (300,500)]]
+            logic_w, logic_h = WINDOW_SIZE, WINDOW_SIZE
+            bg_surface = None
 
-        # Tính toán hệ số Scale để ảnh tự động vừa vặn với WINDOW_SIZE
-        xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
-        mx = max(max(xs), max(ys))
-        if mx > 0:
-            scale = (WINDOW_SIZE - 80) / mx
+        if logic_w > 0 and logic_h > 0:
+            scale_x = (WINDOW_SIZE - 80) / logic_w
+            scale_y = (WINDOW_SIZE - 80) / logic_h
+            scale = min(scale_x, scale_y)
         else:
             scale = 1.0
+
+        offset_x = (WINDOW_SIZE - (logic_w * scale)) / 2
+        offset_y = (WINDOW_SIZE - (logic_h * scale)) / 2
+
+        if bg_surface is not None:
+            img_w_scr = int(logic_w * scale)
+            img_h_scr = int(logic_h * scale)
+            scaled_bg = pygame.transform.smoothscale(bg_surface, (img_w_scr, img_h_scr))
+            top_left_x = int(offset_x)
+            top_left_y = int(offset_y)
+        else:
+            scaled_bg = None
         
         click_step = 0; is_planning = False; planner = None; is_crashed = False; is_finished_all = False
         current_state = (0.0, 0.0, 0.0)
@@ -237,11 +282,19 @@ def main():
         
         if new_map: 
             dyn_obstacles.clear()
+            if logic_w > 0 and logic_h > 0:
+                NUM_STUDENTS = 0  
+                for _ in range(NUM_STUDENTS):
+                    dyn_obstacles.append(spawn_new_student())
 
+    offset_x, offset_y = 40, 40
+    top_left_x, top_left_y = 40, 40
     reset_sim(new_map=True)
 
-    def to_scr(pos): return int(pos[0]*scale)+40, int(WINDOW_SIZE - (pos[1]*scale)-40)
-    def from_scr(sx, sy): return (sx - 40) / scale, (WINDOW_SIZE - sy - 40) / scale
+    def to_scr(pos): 
+        return int(pos[0] * scale + offset_x), int(WINDOW_SIZE - (pos[1] * scale + offset_y))
+    def from_scr(sx, sy): 
+        return (sx - offset_x) / scale, (WINDOW_SIZE - sy - offset_y) / scale
     
     def draw_car(state, color=CAR_COLOR):
         x, y, yaw = state
@@ -253,8 +306,7 @@ def main():
         pygame.draw.line(screen, BLACK, to_scr((x,y)), to_scr((fx,fy)), 2)
 
     def plan_next_stage(start_state, target_pos):
-        xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
-        bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
+        bounds = [0, logic_w, 0, logic_h]
         goal_yaw = math.atan2(target_pos[1] - start_state[1], target_pos[0] - start_state[0])
 
         if algo_mode in ["MCPP_Original", "RRT_Original"]:
@@ -279,13 +331,11 @@ def main():
                 return KinematicRRT(start_state, np.array(target_pos), goal_yaw, outer_poly, planner_holes_geom, bounds, None)
             else:
                 return KinematicMCPP(start_state, np.array(target_pos), goal_yaw, outer_poly, planner_holes_geom, bounds, waypoints, None)
-
         else:
             if algo_mode == "RRT*": return RRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
             elif algo_mode == "BI-RRT*": return BiRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
             elif algo_mode == "APF-RRT*": return APFRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
             elif algo_mode == "BI-APF-RRT*": return BiAPFRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
-            elif algo_mode == "GB-RRT*": return GBRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
             elif algo_mode == "MS-BI-RRT*": return MSBiRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
 
     running = True
@@ -293,36 +343,49 @@ def main():
         clock.tick(FPS)
         dt_frame = 1.0 / FPS
         
-        xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
-        bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
+        bounds = [0, logic_w, 0, logic_h]
         safe_car_radius = math.hypot(CAR_L/2 + 1.0, CAR_WIDTH/2)
         
         is_stage_finished = False
         path_planning_failed = False
         
-        # --- KIỂM TRA TRẠNG THÁI VỀ ĐÍCH CỦA CHẶNG ---
         if click_step == 2 and not is_planning and not is_finished_all:
             if flat_planned_path and path_index >= len(flat_planned_path):
                 current_target = ordered_goals[current_stage_idx]
                 dist_to_target = math.hypot(current_state[0] - current_target[0], current_state[1] - current_target[1])
-                
-                if dist_to_target < 60:
-                    is_stage_finished = True
-                else:
-                    path_planning_failed = True
+                if dist_to_target < 60: is_stage_finished = True
+                else: path_planning_failed = True
 
-        # --- KIỂM TRA VA CHẠM THỰC TẾ ---
         if click_step >= 1 and not is_stage_finished and not is_crashed:
             hit_now, _ = check_collision_with_index(current_state[0], current_state[1], current_state[2], outer_poly, real_holes, dyn_obstacles, t_lookahead=0.0)
             if hit_now:
                 is_crashed = True
                 print("💥 CRASH DETECTED!")
 
-        # --- CẬP NHẬT VẬT CẢN ĐỘNG ---
-        for obs in dyn_obstacles:
-            active_robot_state = current_state if (click_step >= 1 and not is_stage_finished) else None
-            active_goal_pos = ordered_goals[current_stage_idx] if (click_step >= 2 and current_stage_idx < len(ordered_goals)) else None
-            obs.move(dt_frame, bounds, outer_poly, real_holes, active_robot_state, safe_car_radius, active_goal_pos, GOAL_RADIUS)
+        # Xác định khi nào "thời gian" trong game tiếp tục chảy
+        time_is_flowing = (click_step == 2 and not is_planning)
+
+        # ========================================================
+        # CẬP NHẬT VẬT CẢN ĐỘNG (Despawn & Respawn Sinh viên)
+        # Sinh viên CHỈ di chuyển khi thuật toán đã tính toán xong
+        # ========================================================
+        if time_is_flowing:
+            for obs in dyn_obstacles[:]: 
+                old_vx, old_vy = obs.vx, obs.vy
+                
+                active_robot_state = current_state if not is_stage_finished else None
+                active_goal_pos = ordered_goals[current_stage_idx] if current_stage_idx < len(ordered_goals) else None
+                
+                obs.move(dt_frame, bounds, outer_poly, real_holes, active_robot_state, safe_car_radius, active_goal_pos, GOAL_RADIUS)
+                
+                # KIỂM TRA ĐIỀU KIỆN BIẾN MẤT (DESPAWN)
+                is_out_of_zone = obs.y < 24.0 or obs.y > 52.0
+                is_bounced = (obs.vx * old_vx < 0) or (obs.vy * old_vy < 0)
+                
+                if is_out_of_zone or is_bounced:
+                    dyn_obstacles.remove(obs)
+                    # Truyền current_state vào để né robot khi đang chạy trên đường
+                    dyn_obstacles.append(spawn_new_student(current_state))
             
         visible_dyn_obs = []
         if click_step >= 1 and not is_stage_finished and not is_crashed:
@@ -331,9 +394,6 @@ def main():
                 if math.hypot(obs.x - rx, obs.y - ry) <= (SENSOR_RADIUS + obs.radius):
                     visible_dyn_obs.append(obs)
 
-        # ========================================================
-        # 1. RADA QUÉT VẬT CẢN MỚI (FOG OF WAR)
-        # ========================================================
         if click_step >= 1 and not is_stage_finished and not is_crashed:
             rx, ry = current_state[0], current_state[1]
             for i, h in enumerate(real_holes):
@@ -344,60 +404,35 @@ def main():
                         if d <= SENSOR_RADIUS:
                             known_hole_indices.add(i)
                             planner_holes_geom.append(h)
-                            print(f"📡 Rada phát hiện chướng ngại vật #{i}!")
+                            need_path_check = True
                             break
 
-        # ========================================================
-        # 2. KIỂM TRA LỘ TRÌNH VÀ RE-PLAN TẠI CHỖ
-        # ========================================================
         if click_step >= 2 and not is_planning and not is_crashed and not is_finished_all:
-            if flat_planned_path and path_index < len(flat_planned_path):
+            if flat_planned_path and path_index < len(flat_planned_path) and need_path_check:
                 path_is_blocked = False
-                
-                # Quét kiểm tra từ điểm tiếp theo đến cuối lộ trình
                 for i in range(path_index, len(flat_planned_path)):
                     pt = flat_planned_path[i]
                     yaw = pt[2] if len(pt) > 2 else current_state[2]
-                    
                     hit, _ = check_collision_with_index(pt[0], pt[1], yaw, outer_poly, planner_holes_geom, None)
                     if hit:
                         path_is_blocked = True
                         break
                 
                 if path_is_blocked:
-                    print("⚠️ Phát hiện vật cản mới chặn đường! Dừng xe và Re-planning...")
                     if sim_report:
                         sim_report.add_obstacle()
                         sim_report.add_replan()
                     
-                    # DỪNG XE, HỦY LỘ TRÌNH VÀ TÍNH ĐƯỜNG MỚI
                     is_planning = True
                     planned_path.clear()
                     flat_planned_path.clear()
                     path_index = 0
                     planner = plan_next_stage(current_state, ordered_goals[current_stage_idx])
+                    
+                need_path_check = False 
 
-        # --- NÉ VẬT CẢN ĐỘNG KHẨN CẤP ---
         emergency_override = False
-        if click_step >= 1 and not is_stage_finished and not is_crashed: 
-            hit, h_idx = check_collision_with_index(current_state[0], current_state[1], current_state[2], outer_poly, real_holes, visible_dyn_obs, t_lookahead=0.8)
-            if hit and h_idx == -3:
-                emergency_override = True
-
-        if emergency_override:
-            rev_dist = VELOCITY_MAX * dt_frame * 1.5
-            nx = current_state[0] - rev_dist * math.cos(current_state[2])
-            ny = current_state[1] - rev_dist * math.sin(current_state[2])
-            w_hit, _ = check_collision_with_index(nx, ny, current_state[2], outer_poly, real_holes, None)
-            if not w_hit:
-                current_state = (nx, ny, current_state[2]) 
-                if len(path_history) == 0 or dist(path_history[-1], (nx, ny)) > 0.5:
-                    path_history.append((nx, ny))
-            if click_step == 2:
-                is_planning = True
-                planned_path.clear(); flat_planned_path.clear(); path_index = 0
-                planner = plan_next_stage(current_state, ordered_goals[current_stage_idx])
-
+                
         # ========================================================
         # EVENT CHUỘT / BÀN PHÍM
         # ========================================================
@@ -414,13 +449,11 @@ def main():
                     reset_sim(False)
                 elif event.key == pygame.K_RETURN and click_step == 1 and len(multi_goals) > 0:
                     click_step = 2; 
-                    print(f"🚀 TÍNH TOÁN NHIỆM VỤ ĐA MỤC TIÊU (AMuGOPIA)...")
                     start_coord = (current_state[0], current_state[1])
                     ordered_goals.clear()
                     ordered_goals.extend(amugopia_sabo_ordering(start_coord, multi_goals))
                     current_stage_idx = 0
                     is_planning = True
-                    print(f"📋 Tổng số trạm cần đi: {len(ordered_goals)}")
                     planner = plan_next_stage(current_state, ordered_goals[current_stage_idx])
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -428,18 +461,11 @@ def main():
                     wx, wy = from_scr(event.pos[0], event.pos[1])
                     if click_step == 0:
                         current_state = (wx, wy, 0.0); click_step = 1
-                        print("📍 Đặt Start xong. Thả tiếp các Goal rồi nhấn ENTER.")
                     elif click_step == 1:
                         multi_goals.append((wx, wy))
-                        print(f"🚩 Đã thêm Goal #{len(multi_goals)}")
 
-        # ========================================================
-        # TÌM ĐƯỜNG VÀ DI CHUYỂN XE
-        # ========================================================
         if not emergency_override and not is_crashed:
-            # 1. TRẠNG THÁI TÌM ĐƯỜNG: Xe đứng yên và tính toán cây RRT
             if is_planning and click_step == 2:
-                # Chạy 100 iterations mỗi frame để thuật toán hội tụ nhanh chóng
                 iters = 100
                 path_segments = planner.plan_step(iterations=iters) if hasattr(planner, 'plan_step') and 'iterations' in planner.plan_step.__code__.co_varnames else planner.plan_step()
                 
@@ -458,7 +484,6 @@ def main():
                     path_index = 0
                     print(f"✅ ĐÃ TÌM ĐƯỢC ĐƯỜNG MỚI CHO CHẶNG {current_stage_idx + 1}!")
                     
-            # 2. TRẠNG THÁI DI CHUYỂN: Chỉ chạy khi đã hoàn tất tìm đường
             elif not is_planning and flat_planned_path and path_index < len(flat_planned_path) and click_step == 2:
                 dynamic_obstacle_incoming = False
                 look_limit = min(path_index + LOOKAHEAD_STEPS * 2, len(flat_planned_path)) 
@@ -475,25 +500,19 @@ def main():
                     current_state = (fs[0], fs[1], fs[2])
                     
                     if sim_report:
-                        sim_report.update_movement(fs[0], fs[1], fs[2], fs[3], fs[4])
+                        sim_report.add_waypoint(fs[0], fs[1], fs[2]) 
                         
                     path_history.append((current_state[0], current_state[1]))
                     path_index += 1
 
-        # ========================================================
-        # LOGIC CHUYỂN CHẶNG KHI ĐẾN ĐÍCH
-        # ========================================================
         if is_stage_finished and not is_finished_all:
             if current_stage_idx < len(ordered_goals) - 1:
-                print(f"🏁 ĐÃ ĐẾN ĐÍCH {current_stage_idx + 1}! Chuẩn bị đi chặng {current_stage_idx + 2}...")
                 current_stage_idx += 1
                 current_state = (flat_planned_path[-1][0], flat_planned_path[-1][1], flat_planned_path[-1][2])
-                
                 planner = plan_next_stage(current_state, ordered_goals[current_stage_idx])
                 planned_path.clear(); flat_planned_path.clear(); path_index = 0
                 is_planning = True
             else:
-                print(f"🏆 ĐÃ HOÀN THÀNH TOÀN BỘ CÁC ĐÍCH!")
                 is_finished_all = True
                 
                 if sim_report:
@@ -503,15 +522,12 @@ def main():
                     sim_report.export_csv(map_name=f"{safe_algo_name}_{current_map_name}", filename="Results/Bao_Cao_Nang_Luong_Tong_Hop.csv")
                 
                 if map_images and current_map_idx < len(map_images) - 1:
-                    print("⏩ Chuyển Map tiếp theo sau 1.5s...")
                     pygame.display.flip()
                     pygame.time.delay(1500)
                     current_map_idx += 1
                     reset_sim(new_map=True)
                     
-        # --- CƠ CHẾ GỠ KẸT ---
         elif path_planning_failed and not is_crashed:
-            print("⚠️ Bị kẹt đường! Tự lùi xe để tìm lại...")
             rev_dist = VELOCITY_MAX * dt_frame * 3.5
             nx = current_state[0] - rev_dist * math.cos(current_state[2])
             ny = current_state[1] - rev_dist * math.sin(current_state[2])
@@ -540,26 +556,28 @@ def main():
                     ui_status = "BRAKING..."; ui_color = (255, 140, 0)
                 else: ui_status = f"MOVING TO GOAL {current_stage_idx+1}"; ui_color = GREEN
 
-        # ========================================================
-        # VẼ GIAO DIỆN ĐỒ HỌA
-        # ========================================================
         screen.fill(WHITE)
-        if outer_poly: pygame.draw.polygon(screen, (50,50,50), [to_scr(p) for p in outer_poly], 2)
+        
+        if scaled_bg is not None:
+            screen.blit(scaled_bg, (top_left_x, top_left_y))
+        else:
+            if outer_poly: 
+                pygame.draw.polygon(screen, BLACK, [to_scr(p) for p in outer_poly], 2)
         
         for i, h in enumerate(real_holes):
-            col = RED if i in known_hole_indices else GHOST_GRAY
-            pygame.draw.polygon(screen, col, [to_scr(p) for p in h])
+            if i in known_hole_indices:
+                pygame.draw.polygon(screen, RED, [to_scr(p) for p in h], 2)
 
         if click_step >= 1 and not is_finished_all and not is_crashed:
             pygame.draw.circle(screen, (200, 230, 255), to_scr(current_state[:2]), int(SENSOR_RADIUS * scale), 1)
 
         for obs in dyn_obstacles:
             if click_step >= 1 and obs in visible_dyn_obs:
-                pygame.draw.circle(screen, DYN_COLOR, to_scr((obs.x, obs.y)), int(obs.radius * scale))
+                pygame.draw.circle(screen, (255, 140, 0), to_scr((obs.x, obs.y)), int(obs.radius * scale))
                 fut_x = obs.x + obs.vx * 1.5; fut_y = obs.y + obs.vy * 1.5
-                pygame.draw.line(screen, (255, 180, 180), to_scr((obs.x, obs.y)), to_scr((fut_x, fut_y)), 3)
+                pygame.draw.line(screen, (255, 200, 100), to_scr((obs.x, obs.y)), to_scr((fut_x, fut_y)), 2)
             else:
-                pygame.draw.circle(screen, (220, 220, 220), to_scr((obs.x, obs.y)), int(obs.radius * scale))
+                pygame.draw.circle(screen, (200, 200, 200), to_scr((obs.x, obs.y)), int(obs.radius * scale))
 
         if click_step >= 2 and planner and hasattr(planner, 'waypoints'):
             wp_scr = [to_scr(wp[:2]) for wp in planner.waypoints]
@@ -573,7 +591,6 @@ def main():
                     else:
                         pygame.draw.circle(screen, (255, 140, 0), pt, 4)
 
-        # Vẽ cây RRT khi đang tính toán
         if is_planning and click_step == 2 and not is_crashed and planner:
             trees_to_draw = []
             if hasattr(planner, 'node_list'):
@@ -591,9 +608,10 @@ def main():
                             pts = [to_scr((px, py)) for px, py in zip(node.path_x, node.path_y)]
                             pygame.draw.lines(screen, col, False, pts, 1)
                         else:
-                            pygame.draw.line(screen, col, to_scr((parent.x, parent.y)), to_scr((node.x, node.y)), 1)
+                            nx, ny = getattr(node, 'state', (node.x, node.y))[:2] if hasattr(node, 'state') else (node.x, node.y)
+                            px, py = getattr(parent, 'state', (parent.x, parent.y))[:2] if hasattr(parent, 'state') else (parent.x, parent.y)
+                            pygame.draw.line(screen, col, to_scr((px, py)), to_scr((nx, ny)), 1)
 
-        # Vẽ đường đi hoàn chỉnh
         if not is_planning and planned_path and click_step == 2:
             for seg in planned_path:
                 points = seg['points']

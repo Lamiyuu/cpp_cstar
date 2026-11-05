@@ -22,15 +22,15 @@ RESULT_DIR = "Results"
 CAR_L = 4.0           # Chiều dài xe thực tế ~4.5 mét
 CAR_WIDTH = 2.0       # Chiều rộng ~2.0 mét
 MAX_STEER = 0.6       # Góc bẻ lái tối đa
-VELOCITY_MAX = 2.0    # Tốc độ tiến (2m/s)
-VELOCITY_MIN = 1.0    # Tốc độ lùi (1m/s)
+VELOCITY_MAX = 8.0    # Tốc độ tiến (8m/s)
+VELOCITY_MIN = 4.0    # Tốc độ lùi (4m/s)
 DT = 0.2              
 SIM_TIME = 0.5
 
 
 # --- THÔNG SỐ CẢM BIẾN & RADAR ---
-LOOKAHEAD_STEPS = 5   
-SENSOR_RADIUS = 15.0  # Bán kính tầm nhìn của Radar
+LOOKAHEAD_STEPS = 10 #5   
+SENSOR_RADIUS = 50.0  # Bán kính tầm nhìn của Radar
 
 # --- THÔNG SỐ CHƯỚNG NGẠI VẬT ĐỘNG ---
 NUM_DYN_OBS = 6       

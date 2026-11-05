@@ -398,7 +398,7 @@ def main():
                     current_state = (fs[0], fs[1], fs[2])
                     
                     if sim_report:
-                        sim_report.update_movement(fs[0], fs[1], fs[2], fs[3], fs[4])
+                        sim_report.add_waypoint(fs[0], fs[1], fs[2])
                         
                     path_history.append((current_state[0], current_state[1]))
                     path_index += 1

@@ -200,14 +200,6 @@ class BiRRTStar(PaperPlannerKinematicBase):
         return None
 
 # ==========================================
-# 3. GB-RRT* 
-# ==========================================
-class GBRRTStar(RRTStar):
-    def sample_free(self):
-        if random.random() < 0.40: return (self.goal_pos[0], self.goal_pos[1])
-        return super().sample_free()
-
-# ==========================================
 # 4. APF-RRT* 
 # ==========================================
 class APFRRTStar(RRTStar):

@@ -3,6 +3,7 @@ import sys
 import os
 import glob
 import math
+import json
 import numpy as np
 import random
 
@@ -22,6 +23,8 @@ ALGO_MODES = [
     "BI-RRT*", "APF-RRT*", "BI-APF-RRT*"
 ]
 
+SCENARIO_FILE = "scenarios_ac300.json"
+
 # ==========================================
 # THUẬT TOÁN AMuGOPIA - SẮP XẾP ĐA MỤC TIÊU
 # ==========================================
@@ -34,6 +37,10 @@ def angle_between_vectors(v1, v2):
     return math.acos(val)
 
 def amugopia_sabo_ordering(start_pos, goals):
+    """
+    Hỗ trợ goals dạng (x, y) hoặc (x, y, yaw).
+    Khi sắp xếp chỉ dùng (x, y) nhưng giữ nguyên góc đỗ yaw đi kèm từng goal.
+    """
     if not goals: return []
     unvisited = goals.copy()
     ordered_path = []
@@ -96,7 +103,7 @@ def main():
     screen = pygame.display.set_mode((WINDOW_SIZE, WINDOW_SIZE))
     pygame.display.set_caption("Stage-by-Stage Planning: Original vs Paper Algorithms")
     clock = pygame.time.Clock()
-    font = pygame.font.SysFont("Consolas", 16)
+    font = pygame.font.SysFont("Consolas", 15)
 
     map_folders = sorted(glob.glob(os.path.join(DATASET_DIR, "AC12_*")))
     
@@ -112,12 +119,13 @@ def main():
     planned_path = []; flat_planned_path = []; path_index = 0; path_history = []
     dyn_obstacles = [] 
     
-    # Biến cho Stage-by-stage
+    # Biến cho Stage-by-stage: mỗi goal có dạng (x, y, yaw)
     multi_goals = [] 
     ordered_goals = []
     current_stage_idx = 0
     
     sim_report = None 
+    drag_start_world = None
     
     click_step = 0 
     is_planning = False
@@ -125,13 +133,97 @@ def main():
     is_finished_all = False
     scale = 1.0
 
+    def to_scr(pos): return int(pos[0]*scale)+40, int(WINDOW_SIZE - (pos[1]*scale)-40)
+    def from_scr(sx, sy): return (sx - 40) / scale, (WINDOW_SIZE - sy - 40) / scale
+    
+    def draw_car(state, color=CAR_COLOR):
+        x, y, yaw = state
+        corners = get_car_corners(x, y, yaw)
+        scr_corners = [to_scr(p) for p in corners]
+        pygame.draw.polygon(screen, color, scr_corners)
+        pygame.draw.polygon(screen, BLACK, scr_corners, 1)
+        fx = x + CAR_L * math.cos(yaw); fy = y + CAR_L * math.sin(yaw)
+        pygame.draw.line(screen, BLACK, to_scr((x,y)), to_scr((fx,fy)), 2)
+
+    def get_current_map_key():
+        if map_folders:
+            return os.path.basename(map_folders[current_map_idx])
+        return "Dummy_Map"
+
+    def load_scenarios():
+        if os.path.exists(SCENARIO_FILE):
+            try:
+                with open(SCENARIO_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        return {}
+
+    def save_current_scenario():
+        if click_step < 1 or not multi_goals:
+            print("⚠️ Chưa có đủ Start và Goals để lưu kịch bản!")
+            return
+        map_key = get_current_map_key()
+        data = load_scenarios()
+        data[map_key] = {
+            "start": [round(current_state[0], 2), round(current_state[1], 2), round(current_state[2], 4)],
+            "goals": [[round(g[0], 2), round(g[1], 2), round(g[2] if len(g) >= 3 and g[2] is not None else 0.0, 4)] for g in multi_goals]
+        }
+        with open(SCENARIO_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        print(f"💾 Đã lưu kịch bản cố định cho [{map_key}] vào {SCENARIO_FILE}!")
+
+    def plan_next_stage(start_state, target_goal):
+        xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
+        bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
+        
+        target_xy = (target_goal[0], target_goal[1])
+        has_custom_yaw = (len(target_goal) >= 3 and target_goal[2] is not None)
+
+        def get_clearance_for_astar(pt):
+            if outer_poly and not point_in_polygon(pt, outer_poly): return 0.0
+            min_dist = 999.0
+            for h in planner_holes_geom:
+                if point_in_polygon(pt, h): return 0.0
+                for i in range(len(h)):
+                    A = h[i]; B = h[(i+1)%len(h)]
+                    d = point_to_segment_dist(pt[0], pt[1], A[0], A[1], B[0], B[1])
+                    if d < min_dist: min_dist = d
+            return min_dist
+
+        # LUÔN TÍNH XƯƠNG SỐNG A* ĐỂ DẪN HƯỚNG CHO MỌI THUẬT TOÁN
+        waypoints = get_topological_path(start_state[:2], target_xy, bounds, get_clearance_for_astar, grid_res=2.0)
+        
+        if has_custom_yaw:
+            goal_yaw = target_goal[2]
+        elif len(waypoints) >= 2:
+            goal_yaw = math.atan2(waypoints[-1][1] - waypoints[-2][1], waypoints[-1][0] - waypoints[-2][0])
+        else:
+            goal_yaw = math.atan2(target_xy[1] - start_state[1], target_xy[0] - start_state[0])
+
+        print(f"📍 A*: Xương sống chặng {current_stage_idx + 1} ({len(waypoints)} điểm) | Góc đỗ: {math.degrees(goal_yaw):.1f}° -> {algo_mode}")
+        
+        if algo_mode == "MCPP_Original":
+            return KinematicMCPP(start_state, np.array(target_xy), goal_yaw, outer_poly, planner_holes_geom, bounds, waypoints, None)
+        elif algo_mode == "RRT_Original":
+            return KinematicRRT(start_state, np.array(target_xy), goal_yaw, outer_poly, planner_holes_geom, bounds, None, waypoints=waypoints)
+        else:
+            if algo_mode == "RRT*": planner_obj = RRTStar(start_state, target_xy, goal_yaw, outer_poly, planner_holes_geom, bounds)
+            elif algo_mode == "BI-RRT*": planner_obj = BiRRTStar(start_state, target_xy, goal_yaw, outer_poly, planner_holes_geom, bounds)
+            elif algo_mode == "APF-RRT*": planner_obj = APFRRTStar(start_state, target_xy, goal_yaw, outer_poly, planner_holes_geom, bounds)
+            elif algo_mode == "BI-APF-RRT*": planner_obj = BiAPFRRTStar(start_state, target_xy, goal_yaw, outer_poly, planner_holes_geom, bounds)
+            elif algo_mode == "MS-BI-RRT*": planner_obj = MSBiRRTStar(start_state, target_xy, goal_yaw, outer_poly, planner_holes_geom, bounds)
+            planner_obj.waypoints = waypoints
+            return planner_obj
+
     def reset_sim(new_map=False):
         nonlocal outer_poly, real_holes, current_state, known_hole_indices, planner_holes_geom
         nonlocal planner, planned_path, flat_planned_path, path_index, is_planning, scale, path_history, click_step
         nonlocal dyn_obstacles, is_crashed, multi_goals, ordered_goals, current_stage_idx, is_finished_all
-        nonlocal sim_report 
+        nonlocal sim_report, drag_start_world
         
         sim_report = EnergyTracker()
+        drag_start_world = None
         
         use_dummy = False
         if map_folders:
@@ -161,55 +253,33 @@ def main():
         if new_map: 
             dyn_obstacles.clear()
 
-    reset_sim(new_map=True)
-
-    def to_scr(pos): return int(pos[0]*scale)+40, int(WINDOW_SIZE - (pos[1]*scale)-40)
-    def from_scr(sx, sy): return (sx - 40) / scale, (WINDOW_SIZE - sy - 40) / scale
-    
-    def draw_car(state, color=CAR_COLOR):
-        x, y, yaw = state
-        corners = get_car_corners(x, y, yaw)
-        scr_corners = [to_scr(p) for p in corners]
-        pygame.draw.polygon(screen, color, scr_corners)
-        pygame.draw.polygon(screen, BLACK, scr_corners, 1)
-        fx = x + CAR_L * math.cos(yaw); fy = y + CAR_L * math.sin(yaw)
-        pygame.draw.line(screen, BLACK, to_scr((x,y)), to_scr((fx,fy)), 2)
-
-    def plan_next_stage(start_state, target_pos):
-        xs = [p[0] for p in outer_poly]; ys = [p[1] for p in outer_poly]
-        bounds = [0, max(max(xs), max(ys)), 0, max(max(xs), max(ys))] if outer_poly else [0, 700, 0, 700]
-        goal_yaw = math.atan2(target_pos[1] - start_state[1], target_pos[0] - start_state[0])
-
-        if algo_mode in ["MCPP_Original", "RRT_Original"]:
-            def get_clearance_for_astar(pt):
-                if outer_poly and not point_in_polygon(pt, outer_poly): return 0.0
-                min_dist = 999.0
-                for h in planner_holes_geom:
-                    if point_in_polygon(pt, h): return 0.0
-                    for i in range(len(h)):
-                        A = h[i]; B = h[(i+1)%len(h)]
-                        d = point_to_segment_dist(pt[0], pt[1], A[0], A[1], B[0], B[1])
-                        if d < min_dist: min_dist = d
-                return min_dist
-
-            waypoints = get_topological_path(start_state[:2], target_pos, bounds, get_clearance_for_astar, grid_res=2.0)
-            if len(waypoints) >= 2:
-                goal_yaw = math.atan2(waypoints[-1][1] - waypoints[-2][1], waypoints[-1][0] - waypoints[-2][0])
-
-            print(f"📍 A*: Xương sống chặng {current_stage_idx + 1} ({len(waypoints)} điểm) -> {algo_mode}")
+        # --- TỰ ĐỘNG NẠP KỊCH BẢN TỪ SCENARIOS_AC300.JSON NẾU ĐÃ CÓ ---
+        map_key = get_current_map_key()
+        scenarios = load_scenarios()
+        if map_key in scenarios:
+            sc = scenarios[map_key]
+            current_state = tuple(sc["start"])
+            multi_goals.extend([tuple(g) for g in sc["goals"]])
             
-            if algo_mode == "RRT_Original":
-                return KinematicRRT(start_state, np.array(target_pos), goal_yaw, outer_poly, planner_holes_geom, bounds, None)
-            else:
-                return KinematicMCPP(start_state, np.array(target_pos), goal_yaw, outer_poly, planner_holes_geom, bounds, waypoints, None)
+            # Quét Rada lần đầu tại điểm xuất phát trước khi lập kế hoạch chặng 1
+            rx, ry = current_state[0], current_state[1]
+            for i, h in enumerate(real_holes):
+                for j in range(len(h)):
+                    A = h[j]; B = h[(j+1)%len(h)]
+                    if point_to_segment_dist(rx, ry, A[0], A[1], B[0], B[1]) <= SENSOR_RADIUS:
+                        known_hole_indices.add(i)
+                        planner_holes_geom.append(h)
+                        break
 
-        else:
-            if algo_mode == "RRT*": return RRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
-            elif algo_mode == "BI-RRT*": return BiRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
-            elif algo_mode == "APF-RRT*": return APFRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
-            elif algo_mode == "BI-APF-RRT*": return BiAPFRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
-            elif algo_mode == "GB-RRT*": return GBRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
-            elif algo_mode == "MS-BI-RRT*": return MSBiRRTStar(start_state, target_pos, goal_yaw, outer_poly, planner_holes_geom, bounds)
+            start_coord = (current_state[0], current_state[1])
+            ordered_goals.extend(amugopia_sabo_ordering(start_coord, multi_goals))
+            current_stage_idx = 0
+            click_step = 2
+            is_planning = True
+            print(f"🎯 Đã tự động nạp kịch bản [{map_key}]: Start=({current_state[0]:.1f}, {current_state[1]:.1f}, {math.degrees(current_state[2]):.1f}°), Số Goal={len(multi_goals)}")
+            planner = plan_next_stage(current_state, ordered_goals[current_stage_idx])
+
+    reset_sim(new_map=True)
 
     running = True
     while running:
@@ -244,7 +314,7 @@ def main():
         # --- CẬP NHẬT VẬT CẢN ĐỘNG ---
         for obs in dyn_obstacles:
             active_robot_state = current_state if (click_step >= 1 and not is_stage_finished) else None
-            active_goal_pos = ordered_goals[current_stage_idx] if (click_step >= 2 and current_stage_idx < len(ordered_goals)) else None
+            active_goal_pos = ordered_goals[current_stage_idx][:2] if (click_step >= 2 and current_stage_idx < len(ordered_goals)) else None
             obs.move(dt_frame, bounds, outer_poly, real_holes, active_robot_state, safe_car_radius, active_goal_pos, GOAL_RADIUS)
             
         visible_dyn_obs = []
@@ -277,7 +347,6 @@ def main():
             if flat_planned_path and path_index < len(flat_planned_path):
                 path_is_blocked = False
                 
-                # Quét kiểm tra từ điểm tiếp theo đến cuối lộ trình
                 for i in range(path_index, len(flat_planned_path)):
                     pt = flat_planned_path[i]
                     yaw = pt[2] if len(pt) > 2 else current_state[2]
@@ -293,7 +362,6 @@ def main():
                         sim_report.add_obstacle()
                         sim_report.add_replan()
                     
-                    # DỪNG XE, HỦY LỘ TRÌNH VÀ TÍNH ĐƯỜNG MỚI
                     is_planning = True
                     planned_path.clear()
                     flat_planned_path.clear()
@@ -322,21 +390,34 @@ def main():
                 planner = plan_next_stage(current_state, ordered_goals[current_stage_idx])
 
         # ========================================================
-        # EVENT CHUỘT / BÀN PHÍM
+        # EVENT CHUỘT / BÀN PHÍM (KÉO CHUỘT CHỌN GÓC ĐỖ & LƯU KỊCH BẢN)
         # ========================================================
         for event in pygame.event.get():
             if event.type == pygame.QUIT: running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_n: 
                     if map_folders: current_map_idx=(current_map_idx+1)%len(map_folders); reset_sim(True)
-                elif event.key == pygame.K_r: reset_sim(False)
+                elif event.key == pygame.K_r: 
+                    reset_sim(False)
+                elif event.key == pygame.K_s:
+                    save_current_scenario()
+                elif event.key == pygame.K_c:
+                    map_key = get_current_map_key()
+                    data = load_scenarios()
+                    if map_key in data:
+                        del data[map_key]
+                        with open(SCENARIO_FILE, "w", encoding="utf-8") as f:
+                            json.dump(data, f, indent=4, ensure_ascii=False)
+                        print(f"🗑️ Đã xóa kịch bản cố định của [{map_key}]. Kéo chuột để tạo mới!")
+                    reset_sim(False)
                 elif event.key == pygame.K_TAB: 
                     algo_idx = (algo_idx + 1) % len(ALGO_MODES)
                     algo_mode = ALGO_MODES[algo_idx]
                     print(f"🔄 Chuyển sang thuật toán: {algo_mode}")
                     reset_sim(False)
                 elif event.key == pygame.K_RETURN and click_step == 1 and len(multi_goals) > 0:
-                    click_step = 2; 
+                    save_current_scenario()
+                    click_step = 2
                     print(f"🚀 TÍNH TOÁN NHIỆM VỤ ĐA MỤC TIÊU (AMuGOPIA)...")
                     start_coord = (current_state[0], current_state[1])
                     ordered_goals.clear()
@@ -347,22 +428,31 @@ def main():
                     planner = plan_next_stage(current_state, ordered_goals[current_stage_idx])
 
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if not is_crashed:
-                    wx, wy = from_scr(event.pos[0], event.pos[1])
+                if not is_crashed and click_step in [0, 1]:
+                    drag_start_world = from_scr(event.pos[0], event.pos[1])
+
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if not is_crashed and drag_start_world is not None:
+                    release_world = from_scr(event.pos[0], event.pos[1])
+                    dx = release_world[0] - drag_start_world[0]
+                    dy = release_world[1] - drag_start_world[1]
+                    chosen_yaw = math.atan2(dy, dx) if math.hypot(dx, dy) > 1.5 else 0.0
+                    
                     if click_step == 0:
-                        current_state = (wx, wy, 0.0); click_step = 1
-                        print("📍 Đặt Start xong. Thả tiếp các Goal rồi nhấn ENTER.")
+                        current_state = (drag_start_world[0], drag_start_world[1], chosen_yaw)
+                        click_step = 1
+                        print(f"📍 Đặt Start: ({current_state[0]:.1f}, {current_state[1]:.1f}), Góc đầu xe: {math.degrees(chosen_yaw):.1f}°. Kéo thả tiếp các Goal rồi nhấn ENTER.")
                     elif click_step == 1:
-                        multi_goals.append((wx, wy))
-                        print(f"🚩 Đã thêm Goal #{len(multi_goals)}")
+                        multi_goals.append((drag_start_world[0], drag_start_world[1], chosen_yaw))
+                        print(f"🚩 Đã thêm Goal #{len(multi_goals)}: ({drag_start_world[0]:.1f}, {drag_start_world[1]:.1f}), Góc đỗ: {math.degrees(chosen_yaw):.1f}°")
+                    
+                    drag_start_world = None
 
         # ========================================================
         # TÌM ĐƯỜNG VÀ DI CHUYỂN XE
         # ========================================================
         if not emergency_override and not is_crashed:
-            # 1. TRẠNG THÁI TÌM ĐƯỜNG: Xe đứng yên và tính toán cây RRT
             if is_planning and click_step == 2:
-                # Chạy 100 iterations mỗi frame để thuật toán hội tụ nhanh chóng
                 iters = 100
                 path_segments = planner.plan_step(iterations=iters) if hasattr(planner, 'plan_step') and 'iterations' in planner.plan_step.__code__.co_varnames else planner.plan_step()
                 
@@ -381,7 +471,6 @@ def main():
                     path_index = 0
                     print(f"✅ ĐÃ TÌM ĐƯỢC ĐƯỜNG MỚI CHO CHẶNG {current_stage_idx + 1}!")
                     
-            # 2. TRẠNG THÁI DI CHUYỂN: Chỉ chạy khi đã hoàn tất tìm đường
             elif not is_planning and flat_planned_path and path_index < len(flat_planned_path) and click_step == 2:
                 dynamic_obstacle_incoming = False
                 look_limit = min(path_index + LOOKAHEAD_STEPS * 2, len(flat_planned_path)) 
@@ -420,7 +509,7 @@ def main():
                 is_finished_all = True
                 
                 if sim_report:
-                    current_map_name = os.path.basename(map_folders[current_map_idx]) if map_folders else "Dummy_Map"
+                    current_map_name = get_current_map_key()
                     safe_algo_name = algo_mode.replace("*", "Star")
                     sim_report.export_report(f"Results/Report_{safe_algo_name}_{current_map_name}.txt") 
                     sim_report.export_csv(map_name=f"{safe_algo_name}_{current_map_name}", filename="Results/Bao_Cao_Nang_Luong_Tong_Hop.csv")
@@ -450,10 +539,10 @@ def main():
         # --- GIAO DIỆN UI ---
         ui_status = ""
         ui_color = BLUE
-        if is_crashed: ui_status = "CRASHED! PRESS 'R' TO RESTART"; ui_color = BLACK
+        if is_crashed: ui_status = "CRASHED! PRESS 'R' TO RESTART | 'C' CLEAR SCENARIO"; ui_color = BLACK
         elif emergency_override: ui_status = "DANGER! REVERSING!"; ui_color = RED
-        elif click_step == 0: ui_status = "CLICK START POS"
-        elif click_step == 1: ui_status = "CLICK GOALS -> PRESS ENTER"
+        elif click_step == 0: ui_status = "CLICK & DRAG START POS (POSITION + YAW)"
+        elif click_step == 1: ui_status = "CLICK & DRAG GOALS -> ENTER (AUTO-SAVE)"
         else:
             if is_finished_all: ui_status = "ALL MISSIONS COMPLETE"; ui_color = GREEN
             elif path_planning_failed: ui_status = "PLAN FAILED! REVERSING..."; ui_color = (255, 140, 0)
@@ -514,7 +603,9 @@ def main():
                             pts = [to_scr((px, py)) for px, py in zip(node.path_x, node.path_y)]
                             pygame.draw.lines(screen, col, False, pts, 1)
                         else:
-                            pygame.draw.line(screen, col, to_scr((parent.x, parent.y)), to_scr((node.x, node.y)), 1)
+                            nx, ny = getattr(node, 'state', (node.x, node.y))[:2] if hasattr(node, 'state') else (node.x, node.y)
+                            px, py = getattr(parent, 'state', (parent.x, parent.y))[:2] if hasattr(parent, 'state') else (parent.x, parent.y)
+                            pygame.draw.line(screen, col, to_scr((px, py)), to_scr((nx, ny)), 1)
 
         # Vẽ đường đi hoàn chỉnh
         if not is_planning and planned_path and click_step == 2:
@@ -530,9 +621,16 @@ def main():
         if len(path_history) > 1:
             pygame.draw.lines(screen, BLACK, False, [to_scr(p) for p in path_history], 1)
 
+        # Vẽ mũi tên xem trước khi đang nhấn giữ và kéo chuột chọn góc đỗ
+        if drag_start_world is not None:
+            mx_scr, my_scr = pygame.mouse.get_pos()
+            pygame.draw.circle(screen, RED, to_scr(drag_start_world), 5)
+            pygame.draw.line(screen, RED, to_scr(drag_start_world), (mx_scr, my_scr), 2)
+
+        # Vẽ các Goal kèm kim chỉ hướng góc đỗ xe
         if click_step >= 1:
             for i, goal in enumerate(multi_goals):
-                g_scr = to_scr(goal)
+                g_scr = to_scr((goal[0], goal[1]))
                 try:
                     order_in_route = ordered_goals.index(goal)
                     is_visited = order_in_route < current_stage_idx
@@ -541,13 +639,20 @@ def main():
                 
                 color = (150, 150, 150) if is_visited else BLUE
                 pygame.draw.circle(screen, color, g_scr, int(GOAL_RADIUS * scale))
+                
+                if len(goal) >= 3 and goal[2] is not None:
+                    arrow_len = 6.0
+                    gx_end = goal[0] + arrow_len * math.cos(goal[2])
+                    gy_end = goal[1] + arrow_len * math.sin(goal[2])
+                    pygame.draw.line(screen, RED if not is_visited else (120, 120, 120), g_scr, to_scr((gx_end, gy_end)), 2)
+
                 text = font.render(str(i+1), True, (255, 255, 255))
                 screen.blit(text, (g_scr[0]-5, g_scr[1]-8))
 
         if click_step >= 1: 
             draw_car(current_state, BLACK if is_crashed else CAR_COLOR)
 
-        screen.blit(font.render(f"Mode: {algo_mode} | [TAB] Switch | [N] Next Map | [R] Reset", True, BLUE), (10, 10))
+        screen.blit(font.render(f"Mode: {algo_mode} | [TAB] Switch | [N] Next | [R] Reset | [S] Save | [C] Clear", True, BLUE), (10, 10))
         screen.blit(font.render(f"Status: {ui_status}", True, ui_color), (10, 30))
         pygame.display.flip()
 

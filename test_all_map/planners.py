@@ -1,11 +1,15 @@
 import random
 import math
 import numpy as np
-from config import *
-from core_math import dist, normalize_angle, simulate_step, reeds_shepp_planning
-from environment import check_path_collision
 import heapq
 import sys
+from config import *
+from core_math import (
+    dist, normalize_angle, simulate_step, reeds_shepp_planning,
+    get_nearest_waypoint_tangent, calc_trajectory_angle_cost
+)
+from environment import check_path_collision
+
 sys.setrecursionlimit(5000)
 
 def angle_between_vectors(v1, v2):
@@ -69,7 +73,6 @@ def amugopia_sabo_ordering(start_pos, goals):
         unvisited.remove(next_node)
         current = next_node
         
-    # --- ĐÃ XÓA DÒNG ÉP KHÉP KÍN CHU TRÌNH ---
     return ordered_path
 
 def get_topological_path(start_pos, goal_pos, bounds, clearance_func, grid_res=2.0):
@@ -113,10 +116,9 @@ def get_topological_path(start_pos, goal_pos, bounds, clearance_func, grid_res=2
                 continue
                 
             # ĐIỀU KIỆN MỀM: Phạt cực nặng nếu đi gần vạch (dưới 5.0)
-            # Điều này ép A* luôn phải lách ra giữa hành lang mà không lo bị kẹt
             penalty = 0.0
             if clearance < 5.0:
-                penalty = (5.0 - clearance) * 10.0 # Hệ số phạt khổng lồ
+                penalty = (5.0 - clearance) * 10.0
 
             tentative_g = g_score[current] + math.hypot(dx, dy) + penalty
             
@@ -136,12 +138,9 @@ def get_topological_path(start_pos, goal_pos, bounds, clearance_func, grid_res=2
     if not path:
         return [goal_pos]
         
-    # =========================================================
     # LÀM MƯỢT ĐƯỜNG CAM CHUẨN KINEMATIC (Moving Average Filter)
-    # Biến góc gãy 90 độ thành vòng cung mềm mại cho xe dễ bám
-    # =========================================================
     smoothed_path = path[:]
-    for _ in range(5): # Chạy 5 lớp lọc để đường thật mượt
+    for _ in range(5):
         temp = [smoothed_path[0]]
         for i in range(1, len(smoothed_path)-1):
             nx = smoothed_path[i][0]*0.5 + (smoothed_path[i-1][0]+smoothed_path[i+1][0])*0.25
@@ -153,21 +152,24 @@ def get_topological_path(start_pos, goal_pos, bounds, clearance_func, grid_res=2
     return smoothed_path + [goal_pos]
 
 class Node:
-    def __init__(self, x, y, yaw, parent=None, is_dubins=False, direction=1):
+    def __init__(self, x, y, yaw, parent=None, is_dubins=False, direction=1, steer=0.0, cost=0.0):
         self.x = x; self.y = y; self.yaw = yaw
         self.parent = parent
         self.path_x = []; self.path_y = []; self.path_yaw = []
         self.is_dubins = is_dubins
         self.direction = direction
+        self.steer = steer
+        self.cost = cost
 
 class KinematicRRT:
-    def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, bounds, dyn_obs=None):
+    def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, bounds, dyn_obs=None, waypoints=None):
         self.start = Node(start[0], start[1], start[2])
         self.goal_pos = goal_pos; self.goal_yaw = goal_yaw
         self.outer = outer; self.known_holes = known_holes 
         self.min_x, self.max_x, self.min_y, self.max_y = bounds
         self.node_list = [self.start]
         self.dyn_obs = None 
+        self.waypoints = waypoints
 
     def plan_step(self):
         if random.random() < RRT_GOAL_PROB: rnd = (self.goal_pos[0], self.goal_pos[1])
@@ -178,6 +180,13 @@ class KinematicRRT:
         
         dx = rnd[0] - nearest.x; dy = rnd[1] - nearest.y
         target_yaw = math.atan2(dy, dx)
+        
+        if self.waypoints and len(self.waypoints) >= 2:
+            wp_yaw = get_nearest_waypoint_tangent(nearest.x, nearest.y, self.waypoints)
+            if wp_yaw is not None:
+                diff_wp = normalize_angle(target_yaw - wp_yaw)
+                target_yaw = normalize_angle(wp_yaw + 0.4 * diff_wp)
+                
         diff_head = normalize_angle(target_yaw - nearest.yaw)
         diff_tail = normalize_angle(target_yaw - (nearest.yaw + math.pi))
         
@@ -191,63 +200,12 @@ class KinematicRRT:
         nx, ny, nyaw, px, py, pyaw = simulate_step(nearest.x, nearest.y, nearest.yaw, steer, direction)
         
         if not check_path_collision(px, py, pyaw, self.outer, self.known_holes, self.dyn_obs):
-            new_node = Node(nx, ny, nyaw, nearest, is_dubins=False, direction=direction)
-            new_node.path_x = px; new_node.path_y = py; new_node.path_yaw = pyaw
-            self.node_list.append(new_node)
-            
-            if dist((nx, ny), self.goal_pos) <= DUBINS_CONNECT_DIST:
-                dpath = reeds_shepp_planning(nx, ny, nyaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
-                if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes, self.dyn_obs):
-                    goal_node = Node(self.goal_pos[0], self.goal_pos[1], self.goal_yaw, new_node, is_dubins=True)
-                    goal_node.path_x = dpath.x; goal_node.path_y = dpath.y; goal_node.path_yaw = dpath.yaw
-                    return self.extract_path(goal_node)
-            
-            if dist((nx, ny), self.goal_pos) < GOAL_RADIUS:
-                return self.extract_path(new_node)
-        return None
-
-    def extract_path(self, node):
-        full_path = []
-        while node.parent:
-            points = list(zip(node.path_x, node.path_y, node.path_yaw))
-            segment = {'points': points, 'is_dubins': node.is_dubins, 'direction': node.direction}
-            full_path.insert(0, segment)
-            node = node.parent
-        return full_path
-
-
-class KinematicRRT:
-    def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, bounds, dyn_obs=None):
-        self.start = Node(start[0], start[1], start[2])
-        self.goal_pos = goal_pos; self.goal_yaw = goal_yaw
-        self.outer = outer; self.known_holes = known_holes 
-        self.min_x, self.max_x, self.min_y, self.max_y = bounds
-        self.node_list = [self.start]
-        self.dyn_obs = None 
-
-    def plan_step(self):
-        if random.random() < RRT_GOAL_PROB: rnd = (self.goal_pos[0], self.goal_pos[1])
-        else: rnd = (random.uniform(self.min_x, self.max_x), random.uniform(self.min_y, self.max_y))
-        
-        dists = [(node.x - rnd[0])**2 + (node.y - rnd[1])**2 for node in self.node_list]
-        nearest = self.node_list[dists.index(min(dists))]
-        
-        dx = rnd[0] - nearest.x; dy = rnd[1] - nearest.y
-        target_yaw = math.atan2(dy, dx)
-        diff_head = normalize_angle(target_yaw - nearest.yaw)
-        diff_tail = normalize_angle(target_yaw - (nearest.yaw + math.pi))
-        
-        direction = 1
-        if random.random() < PROB_REVERSE: 
-            direction = -1; diff = diff_tail
-        else: 
-            direction = 1; diff = diff_head
-            
-        steer = max(-MAX_STEER, min(MAX_STEER, diff))
-        nx, ny, nyaw, px, py, pyaw = simulate_step(nearest.x, nearest.y, nearest.yaw, steer, direction)
-        
-        if not check_path_collision(px, py, pyaw, self.outer, self.known_holes, self.dyn_obs):
-            new_node = Node(nx, ny, nyaw, nearest, is_dubins=False, direction=direction)
+            angle_cost = calc_trajectory_angle_cost(
+                px, py, pyaw, self.waypoints,
+                curr_steer=steer, prev_steer=nearest.steer
+            )
+            new_cost = nearest.cost + dist((nearest.x, nearest.y), (nx, ny)) + angle_cost
+            new_node = Node(nx, ny, nyaw, nearest, is_dubins=False, direction=direction, steer=steer, cost=new_cost)
             new_node.path_x = px; new_node.path_y = py; new_node.path_yaw = pyaw
             self.node_list.append(new_node)
             
@@ -274,14 +232,15 @@ class KinematicRRT:
 
 class KinematicMCPP:
     class VNode: 
-        def __init__(self, state, wp_idx=0, is_dubins=False, direction=1):
+        def __init__(self, state, wp_idx=0, is_dubins=False, direction=1, steer=0.0):
             self.state = state 
-            self.wp_idx = wp_idx # ĐÃ BỔ SUNG BIẾN TRÍ NHỚ TIẾN ĐỘ
+            self.wp_idx = wp_idx 
             self.N = 0; self.children = {}
             self.parent_node = None
             self.path_x = []; self.path_y = []; self.path_yaw = []
             self.is_dubins = is_dubins
             self.direction = direction
+            self.steer = steer
     
     class QNode: 
         def __init__(self, parent, action):
@@ -289,7 +248,7 @@ class KinematicMCPP:
             self.n = 0; self.Q = 0.0; self.child_v = None
 
     def __init__(self, start, goal_pos, goal_yaw, outer, known_holes, bounds, waypoints, dyn_obs=None):
-        self.root = self.VNode(start, wp_idx=0)
+        self.root = self.VNode(start, wp_idx=0, steer=0.0)
         self.goal_pos = goal_pos
         self.goal_yaw = goal_yaw
         self.outer = outer
@@ -325,7 +284,6 @@ class KinematicMCPP:
         
         min_dist = float('inf')
         closest_idx = v.wp_idx
-        # Nới rộng vùng quét để xe nhận diện được bước nhảy xa
         search_end = min(len(self.waypoints), v.wp_idx + 20)
         for i in range(v.wp_idx, search_end):
             wp = self.waypoints[i]
@@ -339,16 +297,13 @@ class KinematicMCPP:
         target_idx = closest_idx
         look_ahead_dist = 20.0 
         
-        # --- LOGIC MỚI: ÉP XE BỎ QUA WAYPOINT ĐÃ BỊ LƯỚT QUA ---
         while target_idx < len(self.waypoints) - 1:
             wp = self.waypoints[target_idx]
             d_to_wp = math.hypot(cx - wp[0], cy - wp[1])
             
-            # Kiểm tra góc xem waypoint đang ở trước hay sau lưng xe
             angle_to_wp = math.atan2(wp[1] - cy, wp[0] - cx)
             angle_diff = abs(normalize_angle(angle_to_wp - cyaw))
             
-            # Bỏ qua wp nếu: Nó nằm quá gần HOẶC nó nằm ở phía sau lưng xe (>90 độ)
             if d_to_wp < look_ahead_dist or angle_diff > math.pi/2:
                 target_idx += 1
             else:
@@ -368,16 +323,25 @@ class KinematicMCPP:
             
         ideal_steer = max(-MAX_STEER, min(MAX_STEER, diff))
 
-        # --- ĐÃ KHÔI PHỤC ĐẦY ĐỦ CÁC NHÁNH LÙI VÀ BẺ GẮT ---
+        # Lấy góc tiếp tuyến của xương sống để sinh nhánh đi song song
+        wp_tangent = get_nearest_waypoint_tangent(cx, cy, self.waypoints)
+        if wp_tangent is not None:
+            tangent_diff = normalize_angle(wp_tangent - cyaw) if direction == 1 else normalize_angle(wp_tangent - (cyaw + math.pi))
+            parallel_steer = max(-MAX_STEER, min(MAX_STEER, tangent_diff))
+        else:
+            parallel_steer = 0.0
+
         candidates = [
-            (ideal_steer, direction),
-            (MAX_STEER, direction),
-            (-MAX_STEER, direction),
+            (0.0, direction),                                              # Giữ thẳng vô lăng tuyệt đối
+            (parallel_steer, direction),                                   # Song song với xương sống waypoint
+            (ideal_steer, direction),                                      # Hướng về điểm mồi Lookahead
             (max(-MAX_STEER, min(MAX_STEER, ideal_steer + 0.15)), direction),
             (max(-MAX_STEER, min(MAX_STEER, ideal_steer - 0.15)), direction),
-            (-ideal_steer, -direction), # Nhánh lùi lý tưởng
-            (MAX_STEER, -direction),    # Lùi bẻ gắt
-            (-MAX_STEER, -direction)    # Lùi bẻ gắt
+            (MAX_STEER, direction),
+            (-MAX_STEER, direction),
+            (-ideal_steer, -direction),
+            (MAX_STEER, -direction),
+            (-MAX_STEER, -direction)
         ]
 
         for steer, dir_val in candidates:
@@ -385,7 +349,6 @@ class KinematicMCPP:
             action_key = (steer, dir_val)
             if action_key in v.children: continue
             
-            # Đặt num_steps = 5 (Bước nhảy đủ dài để bỏ qua 3-4 wp, nhưng không đủ để cuộn thành 1 vòng xoắn ốc)
             nx, ny, nyaw, px, py, pyaw = self.macro_step(cx, cy, cyaw, steer, dir_val, num_steps=5)
             
             if not check_path_collision(px, py, pyaw, self.outer, self.known_holes, self.dyn_obs):
@@ -402,7 +365,7 @@ class KinematicMCPP:
         if d <= 0 or dist_to_goal < GOAL_RADIUS:
             return -(waypoints_left * 20.0 + dist_to_goal) 
 
-        if len(v.children) < 8: 
+        if len(v.children) < 10: 
             act = self.expand(v)
             if act:
                 return self.sim_q(v.children[act], d - 1)
@@ -416,7 +379,6 @@ class KinematicMCPP:
     def sim_q(self, q, d):
         if not q.child_v:
             steer, direction = q.action
-            # Đồng bộ num_steps = 5
             nx, ny, nyaw, px, py, pyaw = self.macro_step(
                 q.parent.state[0], q.parent.state[1], q.parent.state[2], 
                 steer, direction, num_steps=5
@@ -424,7 +386,6 @@ class KinematicMCPP:
             
             min_wp_dist = float('inf')
             closest_idx = q.parent.wp_idx
-            # Cho phép nhảy vượt tối đa 25 waypoint để bắt kịp tốc độ của xe
             search_end = min(len(self.waypoints), q.parent.wp_idx + 25) 
             for i in range(q.parent.wp_idx, search_end):
                 wp = self.waypoints[i]
@@ -433,7 +394,7 @@ class KinematicMCPP:
                     min_wp_dist = d_wp
                     closest_idx = i
             
-            q.child_v = self.VNode((nx, ny, nyaw), wp_idx=closest_idx, is_dubins=False, direction=direction)
+            q.child_v = self.VNode((nx, ny, nyaw), wp_idx=closest_idx, is_dubins=False, direction=direction, steer=steer)
             q.child_v.parent_node = q.parent
             q.child_v.path_x, q.child_v.path_y, q.child_v.path_yaw = px, py, pyaw
             self.node_list.append(q.child_v)
@@ -453,24 +414,30 @@ class KinematicMCPP:
             if waypoints_left <= 10 and dist_to_goal < 50.0:  
                 dpath = reeds_shepp_planning(nx, ny, nyaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
                 if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes, self.dyn_obs):
-                    goal_v = self.VNode((self.goal_pos[0], self.goal_pos[1], self.goal_yaw), wp_idx=len(self.waypoints)-1, is_dubins=True)
+                    goal_v = self.VNode((self.goal_pos[0], self.goal_pos[1], self.goal_yaw), wp_idx=len(self.waypoints)-1, is_dubins=True, steer=0.0)
                     goal_v.parent_node = q.child_v
                     goal_v.path_x, goal_v.path_y, goal_v.path_yaw = dpath.x, dpath.y, dpath.yaw
                     goal_v.direction = -1 if any(l < 0 for l in dpath.lengths) else 1
                     self.node_list.append(goal_v) 
                     return 50000.0 
             
-            # Gọi nếu dùng map cũ
-            # if waypoints_left <= 6 and dist_to_goal < 40.0:  
-            #                 dpath = reeds_shepp_planning(nx, ny, nyaw, self.goal_pos[0], self.goal_pos[1], self.goal_yaw, MIN_TURN_RADIUS)
-            #                 if dpath and not check_path_collision(dpath.x, dpath.y, dpath.yaw, self.outer, self.known_holes, self.dyn_obs):
-            #                     goal_v = self.VNode((self.goal_pos[0], self.goal_pos[1], self.goal_yaw), wp_idx=len(self.waypoints)-1, is_dubins=True)
-            #                     goal_v.parent_node = q.child_v
-            #                     goal_v.path_x, goal_v.path_y, goal_v.path_yaw = dpath.x, dpath.y, dpath.yaw
-            #                     goal_v.direction = -1 if any(l < 0 for l in dpath.lengths) else 1
-            #                     self.node_list.append(goal_v) 
-            #                     return 50000.0 
-            cost = (waypoints_left * 20.0) + (min_wp_dist * 15.0)
+            # Tối thiểu hóa góc giữa đường đi thực tế và xương sống waypoint
+            angle_cost = calc_trajectory_angle_cost(
+                px, py, pyaw,
+                self.waypoints,
+                curr_steer=steer,
+                prev_steer=q.parent.steer,
+                w_angle=35.0,
+                w_smooth=25.0
+            )
+            
+            # Nới lỏng khoảng cách ngang trong hành lang 8.0m để xe không bị ép đè lên waypoint
+            if min_wp_dist <= 8.0:
+                corridor_cost = min_wp_dist * 2.0
+            else:
+                corridor_cost = 16.0 + (min_wp_dist - 8.0) * 12.0
+                
+            cost = (waypoints_left * 25.0) + corridor_cost + angle_cost
             return -cost
 
         r = self.sim_v(q.child_v, d)
@@ -480,13 +447,11 @@ class KinematicMCPP:
         return r
 
     def plan_step(self, iterations=50):
-        # [TỐI ƯU NON-BLOCKING]: Chỉ chạy số lượng nhánh được chỉ định mỗi Frame
         for _ in range(iterations): 
             self.sim_v(self.root, 1000) 
         
-        # In log để theo dõi tiến độ đâm rễ
         max_wp = max([n.wp_idx for n in self.node_list])
-        if __import__("random").random() < 0.15: 
+        if random.random() < 0.15: 
             print(f"⏳ MCPP đang đâm rễ: Chạm Waypoint {max_wp}/{len(self.waypoints)-1}")
             
         best_node = None

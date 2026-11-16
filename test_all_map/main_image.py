@@ -283,7 +283,7 @@ def main():
         if new_map: 
             dyn_obstacles.clear()
             if logic_w > 0 and logic_h > 0:
-                NUM_STUDENTS = 0  
+                NUM_STUDENTS = 15
                 for _ in range(NUM_STUDENTS):
                     dyn_obstacles.append(spawn_new_student())
 

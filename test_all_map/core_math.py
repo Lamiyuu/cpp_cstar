@@ -226,27 +226,21 @@ def get_nearest_waypoint_tangent(x, y, waypoints):
 def calc_trajectory_angle_cost(path_x, path_y, path_yaw, waypoints, 
                                curr_steer=0.0, prev_steer=0.0, 
                                w_angle=20.0, w_smooth=15.0):
-    """
-    Tính chi phí góc lệch giữa đường đi thực tế (trajectory) và đường xương sống waypoint.
-    Giá trị trả về càng nhỏ -> Đường đi càng song song với xương sống và càng ít ziczac.
-    """
     if not waypoints or len(waypoints) < 2 or not path_x:
         return w_smooth * ((curr_steer - prev_steer) ** 2)
         
     total_angle_error = 0.0
     n_pts = len(path_x)
     
-    # Tính trung bình độ lệch góc dọc theo toàn bộ nhánh quỹ đạo thực tế
+    # Luôn so sánh góc MŨI XE (path_yaw) với hướng tiếp tuyến của Waypoint
+    # để ép xe phải xoay mũi về đúng chiều đường A* chứ không được đi lùi suốt tuyến
     for i in range(n_pts):
         wp_yaw = get_nearest_waypoint_tangent(path_x[i], path_y[i], waypoints)
         if wp_yaw is not None:
-            # Dùng (1 - cos(d_theta)) để phạt mượt và chuẩn đạo hàm
             d_theta = path_yaw[i] - wp_yaw
             total_angle_error += (1.0 - math.cos(d_theta))
             
     mean_angle_error = total_angle_error / n_pts
-    
-    # Phạt biến thiên góc lái (chống đảo vô lăng Trái <-> Phải liên tục)
     steer_jerk_cost = (curr_steer - prev_steer) ** 2
     
     return w_angle * mean_angle_error + w_smooth * steer_jerk_cost
